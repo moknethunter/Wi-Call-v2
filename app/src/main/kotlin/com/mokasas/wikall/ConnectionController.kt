@@ -44,6 +44,7 @@ internal data class SessionState(
     val muted: Boolean = false,
     val speaker: Boolean = false,
     val internetReady: Boolean = false,
+    val localOnly: Boolean = false,
     val ice: String = "",
     val publicKey: String? = null,
     val missed: List<IncomingMissed> = emptyList(),
@@ -96,7 +97,7 @@ internal class ConnectionController @Inject constructor(
     private val pendingMedia = ArrayDeque<Signal>()
     private var trackedId: UUID? = null
     private var trackedState = CallState.IDLE
-    private val mutable = MutableStateFlow(SessionState())
+    private val mutable = MutableStateFlow(SessionState(localOnly = localOnly()))
     val state = mutable.asStateFlow()
     var onUpdate: ((SessionState) -> Unit)? = null
 
@@ -472,17 +473,14 @@ internal class ConnectionController @Inject constructor(
 
     private fun lanSocketFactory(address: String): javax.net.SocketFactory? {
         val target = InetAddress.getByName(address)
-        return lanNetworks().firstOrNull { (_, properties) ->
-            properties.linkAddresses.any { link ->
-                val local = link.address.address
-                val remote = target.address
-                local.size == remote.size && local.indices.all { index ->
-                    val bits = (link.prefixLength - index * 8).coerceIn(0, 8)
-                    val mask = (0xff shl (8 - bits)) and 0xff
-                    ((local[index].toInt() xor remote[index].toInt()) and mask) == 0
-                }
+        return lanNetworks()
+            .flatMap { (network, properties) ->
+                properties.routes
+                    .filter { it.destination.contains(target) }
+                    .map { route -> network to route.destination.prefixLength }
             }
-        }?.first?.socketFactory
+            .maxByOrNull { (_, prefixLength) -> prefixLength }
+            ?.first?.socketFactory
     }
 
     private fun received(message: Signal) {
@@ -664,12 +662,19 @@ internal class ConnectionController @Inject constructor(
         if (preferences.getBoolean("owner", false)) start(listAddresses().firstOrNull()) else reconnect()
     }
 
-    fun internetEndpoint(): String = preferences.getString("endpoint", "").orEmpty()
+    private fun localOnly(): Boolean = preferences.getBoolean("local_only", false)
 
-    fun configureInternet(value: String) {
+    fun configuredEndpoint(): String = preferences.getString("endpoint", "").orEmpty()
+
+    fun internetEndpoint(): String = if (localOnly()) "" else configuredEndpoint()
+
+    fun configureInternet(value: String, useLocalOnly: Boolean) {
         require(value.isBlank() || directoryUrl(value) != null)
-        if (value.trim() == internetEndpoint()) return
-        preferences.edit().putString("endpoint", value.trim()).apply()
+        if (value.trim() == configuredEndpoint() && useLocalOnly == localOnly()) return
+        preferences.edit()
+            .putString("endpoint", value.trim())
+            .putBoolean("local_only", useLocalOnly)
+            .apply()
         if (internetCall) {
             call.decide(SignalType.END)?.let(::send)
             changed()
@@ -924,8 +929,9 @@ internal class ConnectionController @Inject constructor(
     }
 
     private fun publish(snapshot: SessionState) {
-        mutable.value = snapshot
-        onUpdate?.invoke(snapshot)
+        val current = snapshot.copy(localOnly = localOnly())
+        mutable.value = current
+        onUpdate?.invoke(current)
     }
 
     private fun onMain(current: Int, action: () -> Unit) {

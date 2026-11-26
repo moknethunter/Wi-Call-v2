@@ -221,6 +221,7 @@ class MainActivity : ComponentActivity() {
         var showDialPad by remember { mutableStateOf(false) }
         var editDirectory by remember { mutableStateOf(false) }
         var directoryInput by remember { mutableStateOf("") }
+        var localOnlyInput by remember { mutableStateOf(false) }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -235,7 +236,11 @@ class MainActivity : ComponentActivity() {
                 Image(painterResource(R.drawable.ic_wikall), contentDescription = null, modifier = Modifier.size(52.dp))
                 Column {
                     Text(getString(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
-                    Text(if (session.internetReady) "الاتصال عبر الإنترنت جاهز" else "مكالمات Wi-Call",
+                    Text(when {
+                        session.localOnly -> "الاتصال المحلي فقط"
+                        session.internetReady -> "الاتصال عبر الإنترنت جاهز"
+                        else -> "مكالمات WiKall"
+                    },
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
@@ -361,8 +366,9 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
-            if (session.callId == null) Action("إعداد الاتصال عبر الإنترنت", true) {
-                directoryInput = controller.internetEndpoint()
+            if (session.callId == null) Action("إعداد مسار الاتصال", true) {
+                directoryInput = controller.configuredEndpoint()
+                localOnlyInput = session.localOnly
                 editDirectory = true
             }
             if (session.busy) Action("إلغاء الاتصال", true, ::leave)
@@ -372,12 +378,23 @@ class MainActivity : ComponentActivity() {
 
         if (editDirectory) AlertDialog(
             onDismissRequest = { editDirectory = false },
-            title = { Text("خدمة الاتصال عبر الإنترنت") },
-            text = { OutlinedTextField(directoryInput, { directoryInput = it },
-                label = { Text("رابط HTTPS للخدمة") }, singleLine = true) },
+            title = { Text("مسار الاتصال") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        androidx.compose.material3.Switch(
+                            checked = localOnlyInput,
+                            onCheckedChange = { localOnlyInput = it },
+                        )
+                        Text("محلي فقط", modifier = Modifier.padding(start = 8.dp))
+                    }
+                    OutlinedTextField(directoryInput, { directoryInput = it },
+                        label = { Text("رابط HTTPS لخدمة الإنترنت") }, singleLine = true)
+                }
+            },
             confirmButton = {
                 Button(enabled = directoryInput.isBlank() || directoryUrl(directoryInput) != null, onClick = {
-                    controller.configureInternet(directoryInput)
+                    controller.configureInternet(directoryInput, localOnlyInput)
                     editDirectory = false
                 }) { Text("حفظ") }
             },
