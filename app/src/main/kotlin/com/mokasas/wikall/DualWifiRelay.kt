@@ -22,12 +22,12 @@ internal data class WifiRelayLink(val network: Network, val address: LinkAddress
     fun contains(peer: InetAddress): Boolean = peer is Inet4Address &&
         sameIpv4Subnet(ip.address, peer.address, address.prefixLength)
 
-    fun socket(peer: Inet4Address): DatagramSocket {
+    fun socket(peer: Inet4Address, port: Int = EASYTIER_RELAY_PORT): DatagramSocket {
         require(peer != ip && contains(peer))
         val socket = DatagramSocket(null)
         try {
             network.bindSocket(socket)
-            socket.bind(InetSocketAddress(ip, EASYTIER_RELAY_PORT))
+            socket.bind(InetSocketAddress(ip, port))
             return socket
         } catch (failure: Exception) {
             socket.close()
@@ -37,7 +37,7 @@ internal data class WifiRelayLink(val network: Network, val address: LinkAddress
 }
 
 internal fun wifiRelayLinks(context: Context): List<WifiRelayLink> {
-    val connectivity = context.getSystemService(ConnectivityManager::class.java)
+    val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return emptyList()
     return connectivity.allNetworks.flatMap { network ->
         val capabilities = connectivity.getNetworkCapabilities(network)
         if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) != true ||

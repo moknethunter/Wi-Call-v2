@@ -64,6 +64,8 @@ internal class ConnectionController @Inject constructor(
     // Accessed only on hostControl, including while the listener is still starting.
     private var boundHost: LocalHost? = null
     private val discovery = LanDiscovery(context)
+    private val autoRelay = AutomaticWifiRelay(context)
+    private val relaySearch = relayDiscovery(context)
     private val overlayDiscovery = LanDiscovery(context, "_wikall-ol._udp.", EASYTIER_RELAY_PORT, "WiKall")
     private val overlayAnnouncement = LanDiscovery(context, "_wikall-ol._udp.", EASYTIER_RELAY_PORT, "WiKall")
     @Volatile private var generation = 0
@@ -79,6 +81,7 @@ internal class ConnectionController @Inject constructor(
     private var overlayIp: String? = null
     private var overlayPeer: String? = null
     private var discoveredOverlayPeers = emptyList<String>()
+    private var discoveredRelay: String? = null
     private var directory: DirectoryClient? = null
     private var directoryIdentity: Triple<String, String, java.security.PrivateKey>? = null
     private var directoryVersion = 0
@@ -256,6 +259,7 @@ internal class ConnectionController @Inject constructor(
         savedClient = saved
         val attempt = ++lanAttempt
         overlayDiscovery.close()
+        relaySearch.close()
         publish(state.value.copy(mode = Mode.CLIENT, busy = true, address = saved.address, number = saved.activation.number, status = "جارٍ البحث عن الخادم المحلي…"))
         if (directoryIdentity == null) {
             val current = generation
@@ -278,23 +282,39 @@ internal class ConnectionController @Inject constructor(
             discovery.find(saved.pin) { address ->
                 if (current == generation && attempt == lanAttempt) {
                     syncClientOverlay(saved, address)
-                    if (address == null && saved.activation.overlaySecret != null &&
-                        overlayBootstrap().isBlank() && android.net.VpnService.prepare(context) == null
-                    ) {
-                        val own = runCatching(::listAddresses).getOrDefault(emptyList()).toSet()
-                        overlayDiscovery.findPeers(saved.pin, own, limit = 6) { peers ->
-                            if (peers.isNotEmpty() && current == generation && attempt == lanAttempt && !call.accepted) {
-                                discoveredOverlayPeers = peers
-                                syncClientOverlay(saved, null)
-                            }
-                        }
-                    }
+                    if (address == null && overlayBootstrap().isBlank()) discoverOverlayRoutes(saved, current, attempt)
                     val gateways = runCatching(::lanGateways).getOrDefault(emptyList())
                     val candidates = lanCandidates(address, gateways, saved.address, saved.activation.address)
                         .filterNot(::overlayAddress) + overlayFallback(null)
                     val targets = candidates.distinct()
                     if (targets.isNotEmpty()) open(saved.copy(address = targets.first()), targets.drop(1))
                     else disconnect("لا يوجد عنوان محلي صالح للخادم.", preserveAccepted = true)
+                }
+            }
+        }
+    }
+
+    private fun discoverOverlayRoutes(saved: SavedConnection, current: Int, attempt: Int) {
+        val secret = saved.activation.overlaySecret ?: return
+        if (android.net.VpnService.prepare(context) != null) return
+        val own = runCatching(::listAddresses).getOrDefault(emptyList()).toSet()
+        relaySearch.findPeers(saved.pin, own, limit = 1, accept = { address, service ->
+            val target = service.attributes["target"]?.decodeToString()
+            val proof = service.attributes["proof"]?.decodeToString()
+            target != null && target in own && proof != null &&
+                Wire.equal(proof, relayProof(secret, saved.pin, address, target))
+        }) { relays ->
+            if (current != generation || attempt != lanAttempt || call.accepted && channel != null) return@findPeers
+            val relay = relays.firstOrNull()
+            if (relay != null) {
+                discoveredRelay = relay
+                syncClientOverlay(saved, null)
+            } else {
+                discoveredRelay = null
+                overlayDiscovery.findPeers(saved.pin, own, limit = 6) scan@{ peers ->
+                    if (current != generation || attempt != lanAttempt || call.accepted && channel != null) return@scan
+                    discoveredOverlayPeers = peers
+                    syncClientOverlay(saved, null)
                 }
             }
         }
@@ -343,7 +363,7 @@ internal class ConnectionController @Inject constructor(
         val address = overlayBootstrap().takeIf(String::isNotBlank) ?: overlayPeer ?: saved.activation.address
         val peer = address.takeUnless(::overlayAddress)
         val peers = discoveredOverlayPeers.filterNot { it == peer }.sorted()
-        openOverlay(OverlayRequest(saved.pin, secret, saved.activation.number, peer, peers))
+        openOverlay(OverlayRequest(saved.pin, secret, saved.activation.number, peer, peers, discoveredRelay))
     }
 
     private fun openOverlay(request: OverlayRequest) {
@@ -361,13 +381,18 @@ internal class ConnectionController @Inject constructor(
         if (address == null) {
             overlayRequest = null
             overlayAnnouncement.close()
+            autoRelay.close()
         } else {
-            overlayAnnouncement.advertise(request.pin)
+            if (firstReady) {
+                overlayAnnouncement.advertise(request.pin)
+                autoRelay.refresh(request)
+            }
         }
         val attached = runCatching { host?.setOverlayAddress(address) }.isSuccess
         val status = when {
             address == null -> "تعذّر تشغيل شبكة EasyTier أو تم إيقافها."
             !attached -> "التراكب جاهز، لكن تعذّر فتح منفذ المكالمات عليه."
+            request.relay != null -> "مهيّأ عبر المرحّل ${request.relay} · $address"
             else -> "عنوان WiKall التراكبي: $address"
         }
         publish(state.value.copy(overlayStatus = status))
@@ -453,7 +478,8 @@ internal class ConnectionController @Inject constructor(
                     val overlayRetry = addressFailure && saved.activation.overlaySecret != null &&
                         overlayRequest?.number == saved.activation.number
                     if (overlayRetry || (online || addressFailure && retryCount > 0) && retryCount < RETRY_DELAYS.size) {
-                        val delay = RETRY_DELAYS[retryCount.coerceAtMost(RETRY_DELAYS.lastIndex)]
+                        val delay = if (overlayRetry && retryCount >= RETRY_DELAYS.size && !call.accepted) 60_000L
+                            else RETRY_DELAYS[retryCount.coerceAtMost(RETRY_DELAYS.lastIndex)]
                         retryCount = (retryCount + 1).coerceAtMost(RETRY_DELAYS.size)
                         retry = Runnable { locate(saved, false) }.also { main.postDelayed(it, delay) }
                     }
@@ -783,6 +809,9 @@ internal class ConnectionController @Inject constructor(
         overlayIp = null
         overlayPeer = null
         discoveredOverlayPeers = emptyList()
+        discoveredRelay = null
+        autoRelay.close()
+        relaySearch.close()
         overlayDiscovery.close()
         overlayAnnouncement.close()
         if (hadOverlay) context.stopService(Intent(context, WikallVpnService::class.java))
@@ -1022,7 +1051,8 @@ internal class ConnectionController @Inject constructor(
     }
 
     private fun currentTopology() = connectivity.activeNetwork to
-        (runCatching(::listAddresses).getOrDefault(emptyList()) + runCatching(::lanGateways).getOrDefault(emptyList())).sorted()
+        (runCatching(::listAddresses).getOrDefault(emptyList()) + runCatching(::lanGateways).getOrDefault(emptyList()) +
+            runCatching { wifiRelayLinks(context).map { "${it.network}:${it.address}" } }.getOrDefault(emptyList())).sorted()
 
     private fun scheduleNetworkCheck() {
         main.post {
@@ -1054,6 +1084,8 @@ internal class ConnectionController @Inject constructor(
                                 discovery.close()
                                 overlayPeer = null
                                 discoveredOverlayPeers = emptyList()
+                                discoveredRelay = null
+                                overlayRequest?.takeIf { overlayIp != null }?.let(autoRelay::refresh)
                                 val old = client
                                 client = null
                                 disconnect("تغيّرت الشبكة المحلية.", preserveAccepted = true)

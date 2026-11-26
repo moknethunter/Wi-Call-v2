@@ -1,8 +1,10 @@
 package com.mokasas.wikall
 
 import android.content.Context
+import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 
@@ -13,13 +15,13 @@ internal class LanDiscovery(
     private val servicePort: Int = PORT,
     private val label: String = "Wi-Call",
 ) {
-    private val manager = context.getSystemService(NsdManager::class.java)
+    private val manager = requireNotNull(context.getSystemService(NsdManager::class.java))
     private val main = Handler(Looper.getMainLooper())
     private var registration: NsdManager.RegistrationListener? = null
     private var discovery: NsdManager.DiscoveryListener? = null
     private var discoveryTimeout: Runnable? = null
 
-    fun advertise(pin: String) {
+    fun advertise(pin: String, network: Network? = null, attributes: Map<String, String> = emptyMap()) {
         close()
         val listener = object : NsdManager.RegistrationListener {
             override fun onRegistrationFailed(info: NsdServiceInfo, code: Int) = Unit
@@ -37,6 +39,8 @@ internal class LanDiscovery(
             serviceType = type
             port = servicePort
             setAttribute("id", discoveryId(pin))
+            attributes.forEach { (key, value) -> setAttribute(key, value) }
+            if (Build.VERSION.SDK_INT >= 33 && network != null) this.network = network
         }
         runCatching { manager.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
     }
@@ -45,7 +49,14 @@ internal class LanDiscovery(
         findPeers(pin, emptySet(), limit = 1) { result(it.firstOrNull()) }
     }
 
-    fun findPeers(pin: String, ignoredAddresses: Set<String>, limit: Int, result: (List<String>) -> Unit) {
+    fun findPeers(
+        pin: String,
+        ignoredAddresses: Set<String>,
+        limit: Int,
+        network: Network? = null,
+        accept: (String, NsdServiceInfo) -> Boolean = { _, _ -> true },
+        result: (List<String>) -> Unit,
+    ) {
         close()
         val id = discoveryId(pin)
         val listener = object : NsdManager.DiscoveryListener {
@@ -80,7 +91,7 @@ internal class LanDiscovery(
                         if (service != null && service.port == servicePort &&
                             service.attributes["id"]?.decodeToString() == id) {
                             service.host?.hostAddress?.takeIf {
-                                privateIpv4(it) && !overlayAddress(it) && it !in ignoredAddresses
+                                privateIpv4(it) && !overlayAddress(it) && it !in ignoredAddresses && accept(it, service)
                             }?.let(addresses::add)
                         }
                         if (addresses.size >= limit) finish() else resolveNext()
@@ -110,7 +121,11 @@ internal class LanDiscovery(
         }
         discovery = listener
         discoveryTimeout = Runnable { listener.finish() }.also { main.postDelayed(it, 3_000) }
-        runCatching { manager.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, listener) }
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33 && network != null) {
+                manager.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, network, { main.post(it) }, listener)
+            } else manager.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, listener)
+        }
             .onFailure { listener.finish() }
     }
 

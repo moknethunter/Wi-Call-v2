@@ -111,6 +111,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun connectActivation(file: ImportedActivation) {
+        getPreferences(MODE_PRIVATE).edit().remove("resumeHost").apply()
         runSession { controller.connect(file.license, file.bytes) }
         if (file.license.overlaySecret != null) {
             VpnService.prepare(this)?.let(overlayPermission::launch)
@@ -257,10 +258,15 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (savedInstanceState == null) handleIntent(intent)
-        if (savedInstanceState == null && intent.action == Intent.ACTION_MAIN && VpnService.prepare(this) == null) {
-            lifecycleScope.launch {
-                if (controller.hasSavedOverlay() && controller.state.value.mode == Mode.HOME && selectedMode == Mode.HOME) {
-                    runSession { controller.reconnect() }
+        if (savedInstanceState == null && intent.action == Intent.ACTION_MAIN) {
+            if (getPreferences(MODE_PRIVATE).getBoolean("resumeHost", false) &&
+                controller.state.value.mode == Mode.HOME && selectedMode == Mode.HOME) {
+                startHost(requestVpn = false)
+            } else if (VpnService.prepare(this) == null) {
+                lifecycleScope.launch {
+                    if (controller.hasSavedOverlay() && controller.state.value.mode == Mode.HOME && selectedMode == Mode.HOME) {
+                        runSession { controller.reconnect() }
+                    }
                 }
             }
         }
@@ -344,11 +350,7 @@ class MainActivity : ComponentActivity() {
                         if ((address != null || session.internetReady) && session.callId == null)
                             Action("شاشة الاتصال") { showDialPad = true }
                         if (address == null && !session.busy && session.number == null) {
-                            Action("تشغيل الخادم") {
-                                val address = runCatching(controller::listAddresses).getOrDefault(emptyList()).firstOrNull()
-                                runSession { controller.start(address) }
-                                VpnService.prepare(this@MainActivity)?.let(overlayPermission::launch)
-                            }
+                            Action("تشغيل الخادم") { startHost() }
                         }
                     }
                     session.publicKey?.let { key ->
@@ -714,7 +716,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun startHost(requestVpn: Boolean = true) {
+        val address = runCatching(controller::listAddresses).getOrDefault(emptyList()).firstOrNull()
+        runSession {
+            controller.start(address)
+            getPreferences(MODE_PRIVATE).edit().putBoolean("resumeHost", true).apply()
+        }
+        if (requestVpn) VpnService.prepare(this)?.let(overlayPermission::launch)
+    }
+
     private fun leave() {
+        getPreferences(MODE_PRIVATE).edit().remove("resumeHost").apply()
         controller.stop()
         stopService(Intent(this, LocalServerForegroundService::class.java))
         selectedMode = Mode.HOME
