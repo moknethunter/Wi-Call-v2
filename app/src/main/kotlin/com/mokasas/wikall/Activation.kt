@@ -20,9 +20,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 internal const val HOST_NUMBER = "99000"
-internal const val USER_LIMIT = 10
+internal const val USER_LIMIT = 30
 internal const val FILE_LIMIT = 12 * 1024
-internal val userNumbers = (99001..99010).map(Int::toString)
+internal val userNumbers = (99001..99999).map(Int::toString)
 
 internal data class DeviceRequest(val signing: PublicKey, val encryption: PublicKey) {
     val serial: String get() = Wire.pin(signing)
@@ -63,13 +63,18 @@ internal data class Enrollment(
 internal class CapacityReached : IllegalStateException("Wi-Call enrollment capacity reached")
 
 // Revoked entries retain their number, so a saved contact never changes owner.
-internal fun allocate(existing: List<Enrollment>, request: DeviceRequest): Enrollment {
+internal fun allocate(existing: List<Enrollment>, request: DeviceRequest, preferredNumber: String? = null): Enrollment {
     val previous = existing.firstOrNull { it.serial == request.serial }
     val signing = Wire.encode(request.signing.encoded)
     val encryption = Wire.encode(request.encryption.encoded)
+    require(preferredNumber == null || preferredNumber in userNumbers)
+    require(previous == null || preferredNumber == null || preferredNumber == previous.number)
     if (previous != null && !previous.revoked && previous.encryption == encryption) return previous
-    val number = previous?.number ?: userNumbers.firstOrNull { candidate -> existing.none { it.number == candidate } }
-        ?: throw CapacityReached()
+    if (previous == null && existing.size >= USER_LIMIT) throw CapacityReached()
+    val number = previous?.number ?: preferredNumber ?: userNumbers.first { candidate ->
+        existing.none { it.number == candidate }
+    }
+    require(existing.none { it.number == number && it.serial != request.serial }) { "Number already assigned" }
     return Enrollment(number, request.serial, signing, encryption, Wire.token())
 }
 
@@ -79,6 +84,7 @@ internal data class Activation(
     val number: String,
     val serial: String,
     val id: String,
+    val overlaySecret: String? = null,
 ) {
     val pin: String get() = Wire.pin(server)
 
@@ -91,6 +97,7 @@ internal data class Activation(
             put("number", number)
             put("serial", serial)
             put("id", id)
+            overlaySecret?.let { put("overlaySecret", it) }
         }.bytes()
         val aes = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
         val payload = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, aes) }
@@ -127,7 +134,9 @@ internal data class Activation(
             val number = decoded.value("number")
             val id = decoded.value("id")
             require(privateIpv4(address) && number in userNumbers && decoded.value("serial") == serial && validNonce(id))
-            return Activation(address, server, number, serial, id)
+            val secret = decoded["overlaySecret"]?.jsonPrimitive?.content
+            require(secret == null || validNonce(secret))
+            return Activation(address, server, number, serial, id, secret)
         }
     }
 }

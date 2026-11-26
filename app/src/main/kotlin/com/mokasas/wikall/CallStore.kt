@@ -52,8 +52,8 @@ internal abstract class LocalData {
     abstract fun saveDevice(device: AssignedDevice)
 
     @Transaction
-    open fun issue(request: DeviceRequest): Enrollment {
-        val issued = allocate(devices().map(AssignedDevice::enrollment), request)
+    open fun issue(request: DeviceRequest, preferredNumber: String?): Enrollment {
+        val issued = allocate(devices().map(AssignedDevice::enrollment), request, preferredNumber)
         saveDevice(AssignedDevice(issued))
         return issued
     }
@@ -122,7 +122,7 @@ internal class CallStore @Inject constructor(@ApplicationContext context: Contex
     override fun find(number: String) = data.device(number)?.enrollment()
     override fun revoke(number: String) = data.revokeDevice(number)
     fun devices() = data.devices().map(AssignedDevice::enrollment)
-    fun issue(request: DeviceRequest) = data.issue(request)
+    fun issue(request: DeviceRequest, preferredNumber: String? = null) = data.issue(request, preferredNumber)
 
     fun saved(identity: DeviceIdentity): SavedConnection? = data.profile()?.let {
         val bytes = Wire.decode(it.credential)

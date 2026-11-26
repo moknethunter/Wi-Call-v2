@@ -23,11 +23,12 @@ import kotlin.concurrent.thread
 
 internal enum class SignalType {
     CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, UNAVAILABLE, TIMEOUT, END, OFFER, ANSWER, ICE, RESTART, REPAIR,
-    HANDOFF_REQUEST, HANDOFF_CHECK, HANDOFF_CONFIRM, HANDOFF
+    HANDOFF_REQUEST, HANDOFF_CHECK, HANDOFF_CONFIRM, HANDOFF, ONLINE_NUMBERS
 }
 
 internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null, val number: String? = null)
 internal val probeId: UUID = UUID(0, 0)
+internal val onlineNumbersProbe = UUID(0, 1)
 private const val MAX_SIGNAL_SIZE = 16 * 1024
 
 private object SignalCodec {
@@ -54,6 +55,10 @@ private object SignalCodec {
             SignalType.CHALLENGE -> require(id == probeId && payload != null && validNonce(payload))
             SignalType.AUTH -> require(id == probeId && payload != null && payload.length <= 420)
             SignalType.OFFER, SignalType.ANSWER, SignalType.ICE -> require(id != probeId && payload != null)
+            SignalType.ONLINE_NUMBERS -> require(
+                id == onlineNumbersProbe && payload != null && payload.length <= 6 * USER_LIMIT + 5 &&
+                    payload.split(',').all(::validNumber),
+            )
             else -> require(payload == null)
         }
         return Signal(type, id, payload, number)
@@ -124,18 +129,36 @@ internal class LocalHost(
         { task -> Thread(task, "wi-call-peer").apply { isDaemon = true } },
     )
 
-    private val listener = (context.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
-        try {
-            enabledProtocols = supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
-            reuseAddress = true
-            bind(InetSocketAddress(address, listenPort), 8)
-        } catch (failure: Exception) {
-            close()
-            throw failure
+    private val tlsContext = context
+    private val primaryAddress = address
+    private val listener = listen(address, listenPort)
+    private var overlayListener: SSLServerSocket? = null
+    private var overlayAddress: String? = null
+
+    private fun listen(address: String, port: Int) =
+        (tlsContext.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
+            try {
+                enabledProtocols = supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
+                reuseAddress = true
+                bind(InetSocketAddress(address, port), 8)
+            } catch (failure: Exception) {
+                close()
+                throw failure
+            }
         }
-    }
 
     val localPort: Int get() = listener.localPort
+
+    fun setOverlayAddress(address: String?) = synchronized(leaseLock) {
+        if (closed.get() || address == overlayAddress || address == primaryAddress) return@synchronized
+        runCatching { overlayListener?.close() }
+        overlayListener = null
+        overlayAddress = null
+        if (address == null) return@synchronized
+        val handler = callbacks ?: return@synchronized
+        overlayListener = listen(address, localPort).also { acceptConnections(it, handler) }
+        overlayAddress = address
+    }
 
     fun revokeDevice(number: String) {
         val (peer, ended) = synchronized(leaseLock) {
@@ -173,10 +196,14 @@ internal class LocalHost(
         check(serving.compareAndSet(false, true))
         val handler = Callbacks(onReady, onSignal, onEnded)
         callbacks = handler
+        acceptConnections(listener, handler)
+    }
+
+    private fun acceptConnections(socketListener: SSLServerSocket, handler: Callbacks) {
         thread(name = "wi-call-listener", isDaemon = true) {
             while (!closed.get()) {
                 val socket = try {
-                    listener.accept() as SSLSocket
+                    socketListener.accept() as SSLSocket
                 } catch (_: IOException) {
                     return@thread
                 }
@@ -242,8 +269,15 @@ internal class LocalHost(
             while (!closed.get()) {
                 val message = channel.receive()
                 require(message.type != SignalType.AUTH && message.type != SignalType.CHALLENGE && message.type != SignalType.READY)
-                if (message.type == SignalType.PING) channel.send(Signal(SignalType.PONG, message.id))
-                else if (message.type == SignalType.PONG) {
+                if (message.type == SignalType.ONLINE_NUMBERS) break
+                if (message.type == SignalType.PING) {
+                    if (message.id == onlineNumbersProbe) {
+                        val numbers = synchronized(leaseLock) {
+                            if (active[user] === channel) (active.keys + HOST_NUMBER).sorted().joinToString(",") else null
+                        } ?: break
+                        channel.send(Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, numbers))
+                    } else channel.send(Signal(SignalType.PONG, message.id))
+                } else if (message.type == SignalType.PONG) {
                     synchronized(leaseLock) { if (active[user] === channel) handler.onSignal(user, message) }
                 } else {
                     val routed = synchronized(leaseLock) {
@@ -303,6 +337,9 @@ internal class LocalHost(
             routes.clear()
             departures.values.forEach { it.cancel(false) }
             departures.clear()
+            runCatching { overlayListener?.close() }
+            overlayListener = null
+            overlayAddress = null
             accepted.toList()
         }
         runCatching(listener::close)
