@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.util.AtomicFile
@@ -80,6 +81,13 @@ class MainActivity : ComponentActivity() {
     private var request by mutableStateOf<DeviceRequest?>(null)
     private var requestedNumber by mutableStateOf("")
     private var activationQr by mutableStateOf<Pair<String, Bitmap>?>(null)
+
+    private val overlayPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (it.resultCode == RESULT_OK) {
+            controller.refreshOverlay()
+            note = "سُمح بتشغيل EasyTier مع تفعيل WiKall."
+        } else note = "يمكن متابعة الاتصال المحلي العادي والإنترنت الاحتياطي."
+    }
 
     private val scanActivation = registerForActivityResult(ScanContract()) { result ->
         val contents = result.contents ?: return@registerForActivityResult
@@ -242,6 +250,13 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (savedInstanceState == null) handleIntent(intent)
+        if (savedInstanceState == null && intent.action == Intent.ACTION_MAIN && VpnService.prepare(this) == null) {
+            lifecycleScope.launch {
+                if (controller.hasSavedOverlay() && controller.state.value.mode == Mode.HOME && selectedMode == Mode.HOME) {
+                    runSession { controller.reconnect() }
+                }
+            }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -277,6 +292,8 @@ class MainActivity : ComponentActivity() {
         var directoryInput by remember { mutableStateOf("") }
         var localOnlyInput by remember { mutableStateOf(false) }
         var showWifiRelay by remember { mutableStateOf(false) }
+        var editOverlay by remember { mutableStateOf(false) }
+        var overlayBootstrapInput by remember { mutableStateOf("") }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -435,6 +452,11 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+            if (session.overlayStatus.isNotBlank()) Text(session.overlayStatus)
+            if (session.callId == null) Action("إعداد شبكة EasyTier المحلية", true) {
+                overlayBootstrapInput = controller.overlayBootstrap()
+                editOverlay = true
+            }
             if (session.callId == null) Action("إعداد مسار الاتصال", true) {
                 directoryInput = controller.configuredEndpoint()
                 localOnlyInput = session.localOnly
@@ -453,6 +475,28 @@ class MainActivity : ComponentActivity() {
                 confirmButton = { Action("إغلاق", true) { activationQr = null } },
             )
         }
+
+        if (editOverlay) AlertDialog(
+            onDismissRequest = { editOverlay = false },
+            title = { Text("شبكة WiKall التراكبية") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("يكتشف WiKall الخادم محليًا. إذا كانت الشبكتان متصلتين عبر هاتف مرحّل، أدخل عنوان المرحّل في شبكتك.")
+                    OutlinedTextField(overlayBootstrapInput, { overlayBootstrapInput = it },
+                        label = { Text("عنوان IPv4 للمرحّل · اختياري") }, singleLine = true)
+                }
+            },
+            confirmButton = {
+                val endpoint = overlayBootstrapInput.trim()
+                Button(enabled = endpoint.isBlank() || privateIpv4(endpoint) && !overlayAddress(endpoint), onClick = {
+                    controller.configureOverlayBootstrap(endpoint)
+                    editOverlay = false
+                    val permission = VpnService.prepare(this@MainActivity)
+                    if (permission == null) controller.refreshOverlay() else overlayPermission.launch(permission)
+                }) { Text("حفظ وتفعيل") }
+            },
+            dismissButton = { Action("إلغاء", true) { editOverlay = false } },
+        )
 
         if (editDirectory) AlertDialog(
             onDismissRequest = { editDirectory = false },

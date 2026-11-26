@@ -84,6 +84,7 @@ internal data class Activation(
     val number: String,
     val serial: String,
     val id: String,
+    val overlaySecret: String? = null,
 ) {
     val pin: String get() = Wire.pin(server)
 
@@ -96,6 +97,7 @@ internal data class Activation(
             put("number", number)
             put("serial", serial)
             put("id", id)
+            overlaySecret?.let { put("overlaySecret", it) }
         }.bytes()
         val aes = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
         val payload = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, aes) }
@@ -132,7 +134,9 @@ internal data class Activation(
             val number = decoded.value("number")
             val id = decoded.value("id")
             require(privateIpv4(address) && number in userNumbers && decoded.value("serial") == serial && validNonce(id))
-            return Activation(address, server, number, serial, id)
+            val secret = decoded["overlaySecret"]?.jsonPrimitive?.content
+            require(secret == null || validNonce(secret))
+            return Activation(address, server, number, serial, id, secret)
         }
     }
 }

@@ -26,8 +26,36 @@ jobs:
       - run: PYTHONPATH=directory python -m unittest discover -s directory/tests -v
       - run: python -m unittest discover -s deploy -v
 
+  easytier:
+    name: Build EasyTier JNI (${{ matrix.abi }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare Rust, Android NDK, and protobuf compiler
+        run: |
+          rustup toolchain install 1.95 --profile minimal
+          rustup run 1.95 cargo install cargo-ndk --version 4.1.2 --locked
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler
+      - name: Compile EasyTier
+        run: tools/build-easytier-android.sh '${{ matrix.abi }}' "$RUNNER_TEMP/easytier"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: easytier-${{ matrix.abi }}
+          path: ${{ runner.temp }}/easytier
+          if-no-files-found: error
+
   android:
-    needs: directory
+    needs: [directory, easytier]
     name: Test and assemble debug APK
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -37,6 +65,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: easytier-*
+          merge-multiple: true
+          path: app/src/main/jniLibs
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4

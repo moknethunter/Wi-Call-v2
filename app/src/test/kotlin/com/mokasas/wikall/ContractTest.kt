@@ -69,6 +69,18 @@ class ContractTest {
         assertThrows(IllegalArgumentException::class.java) { packTransfer(Transfer.REQUEST, ByteArray(FILE_LIMIT + 1)) }
     }
 
+    @Test fun overlayAddressesAreUniqueAndScopedToTheOverlay() {
+        val network = (listOf(HOST_NUMBER) + userNumbers).map {
+            OverlayRequest("A".repeat(64), "X".repeat(32), it, null)
+        }
+        assertEquals(OVERLAY_HOST, network.first().address)
+        assertEquals(network.size, network.map { it.address }.toSet().size)
+        assertTrue(network.all { overlayAddress(it.address) })
+        assertThrows(IllegalArgumentException::class.java) {
+            OverlayRequest("A".repeat(64), "X".repeat(32), HOST_NUMBER, OVERLAY_HOST)
+        }
+    }
+
     @Test fun assignedNumberAndQrRemainBoundToTheRequestedDevice() {
         val device = DeviceRequest(first.public, second.public)
         val issued = allocate(emptyList(), device, "99937")
@@ -76,7 +88,7 @@ class ContractTest {
         assertThrows(IllegalArgumentException::class.java) {
             allocate(listOf(issued), DeviceRequest(second.public, first.public), issued.number)
         }
-        val activation = Activation("192.168.10.1", entry.certificate.publicKey, issued.number, issued.serial, issued.activationId)
+        val activation = Activation("192.168.10.1", entry.certificate.publicKey, issued.number, issued.serial, issued.activationId, Wire.token())
         val bytes = activation.export(entry.privateKey, device.encryption)
         val qr = activationQrText(bytes)
         assertArrayEquals(bytes, activationQrBytes(qr))

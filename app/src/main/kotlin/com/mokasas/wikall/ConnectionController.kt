@@ -46,6 +46,7 @@ internal data class SessionState(
     val internetReady: Boolean = false,
     val localOnly: Boolean = false,
     val usingInternetForCall: Boolean = false,
+    val overlayStatus: String = "",
     val ice: String = "",
     val publicKey: String? = null,
     val missed: List<IncomingMissed> = emptyList(),
@@ -70,6 +71,11 @@ internal class ConnectionController @Inject constructor(
     private var lanAttempt = 0
     private var savedClient: SavedConnection? = null
     private val preferences = context.getSharedPreferences("wi-call-directory", Context.MODE_PRIVATE)
+    private val overlayPreferences = context.getSharedPreferences("wi-call-overlay", Context.MODE_PRIVATE)
+    internal var overlayRequest: OverlayRequest? = null
+        private set
+    private var overlayIp: String? = null
+    private var overlayPeer: String? = null
     private var directory: DirectoryClient? = null
     private var directoryIdentity: Triple<String, String, java.security.PrivateKey>? = null
     private var directoryVersion = 0
@@ -165,6 +171,10 @@ internal class ConnectionController @Inject constructor(
                             publish(state.value.copy(onlineUsers = onlineChannels.keys.toSet()))
                         } },
                     )
+                    if (server != null) {
+                        syncHostOverlay(pin)
+                        runCatching { server.setOverlayAddress(overlayIp) }
+                    }
                 }.onFailure {
                     publish(state.value.copy(busy = false, status = "تعذّر تشغيل الخادم. تحقق من عنوان الشبكة والمنفذ."))
                 }
@@ -177,7 +187,7 @@ internal class ConnectionController @Inject constructor(
         val address = checkNotNull(hostAddress)
         val issued = withContext(Dispatchers.IO) {
             val device = store.issue(request, preferredNumber)
-            val activation = Activation(address, key.certificate.publicKey, device.number, device.serial, device.activationId)
+            val activation = Activation(address, key.certificate.publicKey, device.number, device.serial, device.activationId, hostOverlaySecret())
             device.number to activation.export(key.privateKey, request.encryption)
         }
         refreshUsers()
@@ -254,15 +264,95 @@ internal class ConnectionController @Inject constructor(
                 }
             }
         }
-        if (manual) open(saved)
-        else {
+        if (manual) {
+            syncClientOverlay(saved, saved.address)
+            open(saved, overlayFallback(saved.address))
+        } else {
             val current = generation
             discovery.find(saved.pin) { address ->
                 if (current == generation && attempt == lanAttempt) {
+                    syncClientOverlay(saved, address)
                     val gateways = runCatching(::lanGateways).getOrDefault(emptyList())
                     val candidates = lanCandidates(address, gateways, saved.address, saved.activation.address)
-                    open(saved.copy(address = candidates.first()), candidates.drop(1))
+                        .filterNot(::overlayAddress) + overlayFallback(null)
+                    val targets = candidates.distinct()
+                    if (targets.isNotEmpty()) open(saved.copy(address = targets.first()), targets.drop(1))
+                    else disconnect("لا يوجد عنوان محلي صالح للخادم.", preserveAccepted = true)
                 }
+            }
+        }
+    }
+
+    private fun overlayFallback(existing: String?): List<String> =
+        if (overlayIp != null && overlayRequest?.number != HOST_NUMBER && existing != OVERLAY_HOST) {
+            listOf(OVERLAY_HOST)
+        } else emptyList()
+
+    private fun hostOverlaySecret(): String = synchronized(overlayPreferences) {
+        overlayPreferences.getString("secret", null) ?: Wire.token().also {
+            check(overlayPreferences.edit().putString("secret", it).commit())
+        }
+    }
+
+    suspend fun hasSavedOverlay(): Boolean = withContext(Dispatchers.IO) {
+        runCatching { store.saved(DeviceIdentity.load())?.activation?.overlaySecret != null }.getOrDefault(false)
+    }
+
+    fun refreshOverlay() {
+        val server = identity
+        val client = savedClient
+        if (server != null && host != null) syncHostOverlay(Wire.pin(server.entry.certificate.publicKey))
+        else if (client != null) syncClientOverlay(client, overlayPeer)
+    }
+
+    fun overlayBootstrap(): String = overlayPreferences.getString("peer", "").orEmpty()
+
+    fun configureOverlayBootstrap(address: String) {
+        require(address.isBlank() || privateIpv4(address) && !overlayAddress(address))
+        overlayPreferences.edit().putString("peer", address).apply()
+        refreshOverlay()
+    }
+
+    private fun syncHostOverlay(pin: String) {
+        if (android.net.VpnService.prepare(context) != null) return
+        val peer = overlayBootstrap().takeIf(String::isNotBlank)
+        openOverlay(OverlayRequest(pin, hostOverlaySecret(), HOST_NUMBER, peer))
+    }
+
+    private fun syncClientOverlay(saved: SavedConnection, detected: String?) {
+        val secret = saved.activation.overlaySecret ?: return
+        if (android.net.VpnService.prepare(context) != null) return
+        if (detected != null && !overlayAddress(detected)) overlayPeer = detected
+        val address = overlayBootstrap().takeIf(String::isNotBlank) ?: overlayPeer ?: saved.activation.address
+        val peer = address.takeUnless(::overlayAddress)
+        openOverlay(OverlayRequest(saved.pin, secret, saved.activation.number, peer))
+    }
+
+    private fun openOverlay(request: OverlayRequest) {
+        if (overlayRequest == request) return
+        overlayRequest = request
+        publish(state.value.copy(overlayStatus = "جارٍ تشغيل EasyTier…"))
+        runCatching { context.startForegroundService(Intent(context, WikallVpnService::class.java)) }
+            .onFailure { overlayChanged(request, null) }
+    }
+
+    internal fun overlayChanged(request: OverlayRequest, address: String?) {
+        if (overlayRequest != request) return
+        val firstReady = overlayIp == null && address != null
+        overlayIp = address
+        if (address == null) overlayRequest = null
+        val attached = runCatching { host?.setOverlayAddress(address) }.isSuccess
+        val status = when {
+            address == null -> "تعذّر تشغيل شبكة EasyTier أو تم إيقافها."
+            !attached -> "التراكب جاهز، لكن تعذّر فتح منفذ المكالمات عليه."
+            else -> "عنوان WiKall التراكبي: $address"
+        }
+        publish(state.value.copy(overlayStatus = status))
+        if (firstReady && request.number != HOST_NUMBER && channel == null) {
+            savedClient?.let { saved ->
+                retry?.let(main::removeCallbacks)
+                retry = null
+                locate(saved, false)
             }
         }
     }
@@ -341,8 +431,11 @@ internal class ConnectionController @Inject constructor(
                         else -> failure.message.orEmpty().ifBlank { "تعذّر الاتصال المحلي." }
                     }
                     disconnect(reason, preserveAccepted = true)
-                    if ((online || addressFailure && retryCount > 0) && retryCount < RETRY_DELAYS.size) {
-                        val delay = RETRY_DELAYS[retryCount++]
+                    val overlayRetry = addressFailure && saved.activation.overlaySecret != null &&
+                        overlayRequest?.number == saved.activation.number
+                    if (overlayRetry || (online || addressFailure && retryCount > 0) && retryCount < RETRY_DELAYS.size) {
+                        val delay = RETRY_DELAYS[retryCount.coerceAtMost(RETRY_DELAYS.lastIndex)]
+                        retryCount = (retryCount + 1).coerceAtMost(RETRY_DELAYS.size)
                         retry = Runnable { locate(saved, false) }.also { main.postDelayed(it, delay) }
                     }
                 }
@@ -632,6 +725,11 @@ internal class ConnectionController @Inject constructor(
     fun stop() {
         generation++
         lanAttempt++
+        val hadOverlay = overlayRequest != null
+        overlayRequest = null
+        overlayIp = null
+        overlayPeer = null
+        if (hadOverlay) context.stopService(Intent(context, WikallVpnService::class.java))
         unmonitorNetwork()
         directoryVersion++
         directoryRetry?.let(main::removeCallbacks)
