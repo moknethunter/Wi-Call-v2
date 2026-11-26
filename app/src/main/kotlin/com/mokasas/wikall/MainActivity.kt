@@ -239,7 +239,7 @@ class MainActivity : ComponentActivity() {
                     Text(when {
                         session.localOnly -> "الاتصال المحلي فقط"
                         session.internetReady -> "الاتصال عبر الإنترنت جاهز"
-                        else -> "مكالمات WiKall"
+                        else -> "الاتصال المحلي أولًا"
                     },
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -388,6 +388,7 @@ class MainActivity : ComponentActivity() {
                         )
                         Text("محلي فقط", modifier = Modifier.padding(start = 8.dp))
                     }
+                    Text("عند إيقاف «محلي فقط»، يستخدم WiKall الإنترنت عند تعذّر المسار المحلي.")
                     OutlinedTextField(directoryInput, { directoryInput = it },
                         label = { Text("رابط HTTPS لخدمة الإنترنت") }, singleLine = true)
                 }
@@ -486,6 +487,7 @@ class MainActivity : ComponentActivity() {
         }
         if (status.isNotEmpty()) Text(status)
         val id = session.callId
+        if (id != null) Text(if (session.usingInternetForCall) "المسار: الإنترنت" else "المسار: الشبكة المحلية")
         if (session.callState == CallState.RINGING) {
             Action("قبول") {
                 withMicrophone {

@@ -45,6 +45,7 @@ internal data class SessionState(
     val speaker: Boolean = false,
     val internetReady: Boolean = false,
     val localOnly: Boolean = false,
+    val usingInternetForCall: Boolean = false,
     val ice: String = "",
     val publicKey: String? = null,
     val missed: List<IncomingMissed> = emptyList(),
@@ -724,8 +725,7 @@ internal class ConnectionController @Inject constructor(
                         if (internetCall) requestRepair()
                         else if (call.state == CallState.RECONNECTING) scheduleHandoff()
                     } else pendingInternet?.takeIf { internetCall && it.id == call.id }?.let {
-                        directory?.send(it)
-                        pendingInternet = null
+                        if (directory?.send(it) == true) pendingInternet = null
                     }
                     preferences.edit().putBoolean("owner", number == HOST_NUMBER).apply()
                     if (number != HOST_NUMBER) savedClient?.let { connection ->
@@ -929,7 +929,10 @@ internal class ConnectionController @Inject constructor(
     }
 
     private fun publish(snapshot: SessionState) {
-        val current = snapshot.copy(localOnly = localOnly())
+        val current = snapshot.copy(
+            localOnly = localOnly(),
+            usingInternetForCall = snapshot.callId != null && internetCall,
+        )
         mutable.value = current
         onUpdate?.invoke(current)
     }
