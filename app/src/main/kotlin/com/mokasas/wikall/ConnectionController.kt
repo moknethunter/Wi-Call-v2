@@ -67,7 +67,7 @@ internal class ConnectionController @Inject constructor(
     private val autoRelay = AutomaticWifiRelay(context)
     private val relaySearch = relayDiscovery(context)
     private val overlayDiscovery = LanDiscovery(context, "_wikall-ol._udp.", EASYTIER_RELAY_PORT, "WiKall")
-    private val overlayAnnouncement = LanDiscovery(context, "_wikall-ol._udp.", EASYTIER_RELAY_PORT, "WiKall")
+    private val overlayAnnouncement = OverlayAnnouncements(context)
     @Volatile private var generation = 0
     private var host: LocalHost? = null
     private var client: LocalClient? = null
@@ -331,6 +331,26 @@ internal class ConnectionController @Inject constructor(
         }
     }
 
+    fun canCreateOverlaySecret(): Boolean = !overlayPreferences.contains("secret")
+
+    fun setInitialOverlayPassphrase(passphrase: String): Boolean = synchronized(overlayPreferences) {
+        if (!canCreateOverlaySecret()) return@synchronized false
+        overlayPreferences.edit().putString("secret", newOverlaySecret(passphrase)).commit()
+    }
+
+    private fun refreshOverlayAnnouncements(request: OverlayRequest) {
+        val networks: Set<Network?> = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            lanNetworks().filter { (_, link) ->
+                link.linkAddresses.any {
+                    val address = it.address.hostAddress.orEmpty()
+                    privateIpv4(address) && !overlayAddress(address)
+                }
+            }.mapTo(mutableSetOf<Network?>()) { (network, _) -> network }
+                .ifEmpty { setOf(null) }
+        } else setOf(null)
+        overlayAnnouncement.update(request.pin, networks)
+    }
+
     suspend fun hasSavedOverlay(): Boolean = withContext(Dispatchers.IO) {
         runCatching { store.saved(DeviceIdentity.load())?.activation?.overlaySecret != null }.getOrDefault(false)
     }
@@ -383,10 +403,8 @@ internal class ConnectionController @Inject constructor(
             overlayAnnouncement.close()
             autoRelay.close()
         } else {
-            if (firstReady) {
-                overlayAnnouncement.advertise(request.pin)
-                autoRelay.refresh(request)
-            }
+            refreshOverlayAnnouncements(request)
+            if (firstReady) autoRelay.refresh(request)
         }
         val attached = runCatching { host?.setOverlayAddress(address) }.isSuccess
         val status = when {
@@ -622,8 +640,10 @@ internal class ConnectionController @Inject constructor(
         val manager = context.getSystemService(ConnectivityManager::class.java)
         return manager.allNetworks.mapNotNull { network ->
             val capabilities = manager.getNetworkCapabilities(network) ?: return@mapNotNull null
-            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
-                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return@mapNotNull null
+            if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) ||
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+            ) return@mapNotNull null
             manager.getLinkProperties(network)?.let { network to it }
         }
     }
@@ -1052,7 +1072,9 @@ internal class ConnectionController @Inject constructor(
 
     private fun currentTopology() = connectivity.activeNetwork to
         (runCatching(::listAddresses).getOrDefault(emptyList()) + runCatching(::lanGateways).getOrDefault(emptyList()) +
-            runCatching { wifiRelayLinks(context).map { "${it.network}:${it.address}" } }.getOrDefault(emptyList())).sorted()
+            runCatching {
+                lanNetworks().flatMap { (network, link) -> link.linkAddresses.map { "$network:$it" } }
+            }.getOrDefault(emptyList())).sorted()
 
     private fun scheduleNetworkCheck() {
         main.post {
@@ -1063,6 +1085,7 @@ internal class ConnectionController @Inject constructor(
                 val updated = currentTopology()
                 topology = updated
                 if (updated == previous) return@Runnable
+                overlayRequest?.takeIf { overlayIp != null }?.let(::refreshOverlayAnnouncements)
                 if (updated.first != previous?.first && internetEndpoint().isNotBlank()) openDirectory()
                 if (call.accepted && !internetCall) requestRepair()
                 if (updated.second != previous?.second || channel == null) {

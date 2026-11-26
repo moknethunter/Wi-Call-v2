@@ -1,5 +1,8 @@
 package com.mokasas.wikall
 
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
 internal const val OVERLAY_NETWORK = "10.126.124.0"
 internal const val OVERLAY_PREFIX = 22
 internal const val OVERLAY_HOST = "10.126.124.1"
@@ -48,4 +51,13 @@ internal fun overlayAddress(address: String): Boolean {
     if (!privateIpv4(address)) return false
     val parts = address.split('.')
     return parts[0] == "10" && parts[1] == "126" && parts[2].toInt() in 124..127
+}
+
+internal fun newOverlaySecret(passphrase: String): String {
+    require(passphrase.length in 12..128 && passphrase.isNotBlank())
+    val random = Wire.decode(Wire.token())
+    val key = Mac.getInstance("HmacSHA256").apply {
+        init(SecretKeySpec(random, "HmacSHA256"))
+    }
+    return Wire.encode(key.doFinal(passphrase.encodeToByteArray()).copyOf(24))
 }

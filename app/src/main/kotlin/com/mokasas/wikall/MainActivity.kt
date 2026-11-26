@@ -59,6 +59,7 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextDirection
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
@@ -306,6 +307,7 @@ class MainActivity : ComponentActivity() {
         var showWifiRelay by remember { mutableStateOf(false) }
         var editOverlay by remember { mutableStateOf(false) }
         var overlayBootstrapInput by remember { mutableStateOf("") }
+        var overlayPassphrase by remember { mutableStateOf("") }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -461,6 +463,7 @@ class MainActivity : ComponentActivity() {
             if (session.overlayStatus.isNotBlank()) Text(session.overlayStatus)
             if (session.callId == null) Action("إعداد شبكة EasyTier المحلية", true) {
                 overlayBootstrapInput = controller.overlayBootstrap()
+                overlayPassphrase = ""
                 editOverlay = true
             }
             if (session.callId == null) Action("إعداد مسار الاتصال", true) {
@@ -483,25 +486,38 @@ class MainActivity : ComponentActivity() {
         }
 
         if (editOverlay) AlertDialog(
-            onDismissRequest = { editOverlay = false },
+            onDismissRequest = { editOverlay = false; overlayPassphrase = "" },
             title = { Text("شبكة WiKall التراكبية") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("يكتشف WiKall الخادم محليًا. إذا كانت الشبكتان متصلتين عبر هاتف مرحّل، أدخل عنوان المرحّل في شبكتك.")
+                    Text("يعلن WiKall الشبكة ويبحث عن أجهزة المجموعة تلقائيًا على الوصلات المحلية.")
+                    if (mode == Mode.SERVER && controller.canCreateOverlaySecret()) {
+                        OutlinedTextField(overlayPassphrase, { if (it.length <= 128) overlayPassphrase = it },
+                            label = { Text("كلمة مرور المجموعة الجديدة · اختياري") },
+                            visualTransformation = PasswordVisualTransformation(), singleLine = true)
+                    }
                     OutlinedTextField(overlayBootstrapInput, { overlayBootstrapInput = it },
                         label = { Text("عنوان IPv4 للمرحّل · اختياري") }, singleLine = true)
                 }
             },
             confirmButton = {
                 val endpoint = overlayBootstrapInput.trim()
-                Button(enabled = endpoint.isBlank() || privateIpv4(endpoint) && !overlayAddress(endpoint), onClick = {
+                val validPassphrase = overlayPassphrase.isEmpty() || overlayPassphrase.length >= 12 && overlayPassphrase.isNotBlank()
+                Button(enabled = validPassphrase && (endpoint.isBlank() || privateIpv4(endpoint) && !overlayAddress(endpoint)), onClick = {
+                    if (overlayPassphrase.isNotEmpty() && !controller.setInitialOverlayPassphrase(overlayPassphrase)) {
+                        note = "تعذّر حفظ كلمة المرور. إذا كانت المجموعة موجودة فستبقى بياناتها الحالية."
+                        overlayPassphrase = ""
+                        editOverlay = false
+                        return@Button
+                    }
+                    overlayPassphrase = ""
                     controller.configureOverlayBootstrap(endpoint)
                     editOverlay = false
                     val permission = VpnService.prepare(this@MainActivity)
                     if (permission == null) controller.refreshOverlay() else overlayPermission.launch(permission)
                 }) { Text("حفظ وتفعيل") }
             },
-            dismissButton = { Action("إلغاء", true) { editOverlay = false } },
+            dismissButton = { Action("إلغاء", true) { editOverlay = false; overlayPassphrase = "" } },
         )
 
         if (editDirectory) AlertDialog(

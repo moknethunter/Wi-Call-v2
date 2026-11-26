@@ -62,7 +62,7 @@ internal class LanDiscovery(
         val listener = object : NsdManager.DiscoveryListener {
             val addresses = linkedSetOf<String>()
             val pending = ArrayDeque<NsdServiceInfo>()
-            val seen = mutableSetOf<String>()
+            val seen = mutableSetOf<Pair<String, Network?>>()
             var resolving = false
 
             fun finish() {
@@ -111,8 +111,9 @@ internal class LanDiscovery(
             override fun onServiceLost(info: NsdServiceInfo) = Unit
             override fun onServiceFound(info: NsdServiceInfo) {
                 main.post {
+                    val network = if (Build.VERSION.SDK_INT >= 33) info.network else null
                     if (discovery === this && seen.size < USER_LIMIT + 1 &&
-                        info.serviceName.startsWith("$label ${id.take(12)}") && seen.add(info.serviceName)) {
+                        info.serviceName.startsWith("$label ${id.take(12)}") && seen.add(info.serviceName to network)) {
                         pending.addLast(info)
                         resolveNext()
                     }

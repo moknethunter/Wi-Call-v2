@@ -69,6 +69,16 @@ class ContractTest {
         assertThrows(IllegalArgumentException::class.java) { packTransfer(Transfer.REQUEST, ByteArray(FILE_LIMIT + 1)) }
     }
 
+    @Test fun groupPassphraseDoesNotCreateTheSameSecretForSeparateGroups() {
+        val passphrase = "fixture-only passphrase"
+        val firstGroup = newOverlaySecret(passphrase)
+        val secondGroup = newOverlaySecret(passphrase)
+        assertTrue(validNonce(firstGroup))
+        assertTrue(validNonce(secondGroup))
+        assertNotEquals(firstGroup, secondGroup)
+        assertThrows(IllegalArgumentException::class.java) { newOverlaySecret("short") }
+    }
+
     @Test fun overlayAddressesAreUniqueAndScopedToTheOverlay() {
         val network = (listOf(HOST_NUMBER) + userNumbers).map {
             OverlayRequest("A".repeat(64), "X".repeat(32), it, null)
