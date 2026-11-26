@@ -20,7 +20,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -30,7 +29,6 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import java.net.Inet4Address
 import java.net.InetAddress
-import kotlinx.coroutines.delay
 
 @Composable
 internal fun DualWifiRelayPanel() {
@@ -85,21 +83,38 @@ internal fun DualWifiRelayPanel() {
         else status = "لم يُمنح إذن الاتصال بشبكة Wi-Fi ثانية."
     }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            bridge?.close()
-            request?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
-        }
-    }
-    LaunchedEffect(Unit) {
-        while (true) {
+    DisposableEffect(connectivity, context) {
+        val refresh = Runnable {
             links = wifiRelayLinks(context)
             if (bridge != null && !links.containsAll(activeLinks)) {
                 bridge?.close()
                 bridge = null
                 status = "توقف الترحيل بعد فقدان إحدى وصلتي Wi-Fi."
             }
-            delay(1_000)
+        }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            private fun refreshLinks() {
+                main.removeCallbacks(refresh)
+                main.postDelayed(refresh, 150L)
+            }
+
+            override fun onAvailable(network: Network) = refreshLinks()
+            override fun onLost(network: Network) = refreshLinks()
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: android.net.LinkProperties) = refreshLinks()
+        }
+        val monitoring = runCatching {
+            connectivity.registerNetworkCallback(NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build(), callback, main)
+        }.isSuccess
+        refresh.run()
+        if (!monitoring) status = "تعذّر مراقبة تغيّرات Wi-Fi."
+        onDispose {
+            if (monitoring) runCatching { connectivity.unregisterNetworkCallback(callback) }
+            main.removeCallbacks(refresh)
+            bridge?.close()
+            request?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
         }
     }
 

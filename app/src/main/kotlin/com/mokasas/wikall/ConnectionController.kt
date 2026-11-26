@@ -99,6 +99,8 @@ internal class ConnectionController @Inject constructor(
     private var waiting: Pair<UUID, Long>? = null
     private var timer: Runnable? = null
     private var heartbeat: Runnable? = null
+    private var lastHeartbeatAt = 0L
+    private var probeTimeout: Runnable? = null
     private var retry: Runnable? = null
     private var retryCount = 0
     private var call = LocalCall()
@@ -121,7 +123,7 @@ internal class ConnectionController @Inject constructor(
     fun start(address: String?) {
         require(address == null || privateIpv4(address))
         stop()
-        monitorNetwork()
+        monitorNetwork(serveHotspot = true)
         publish(SessionState(mode = Mode.SERVER, busy = true, status = "جارٍ تشغيل الخادم…"))
         bind(address)
     }
@@ -420,13 +422,8 @@ internal class ConnectionController @Inject constructor(
                     }
                     probe()
                     if (!internetCall && call.accepted) requestRepair()
-                    heartbeat = object : Runnable {
-                        override fun run() {
-                            if (current != generation || channel !== active) return
-                            send(Signal(SignalType.PING, UUID.randomUUID()))
-                            main.postDelayed(this, 10_000)
-                        }
-                    }.also { main.postDelayed(it, 10_000) }
+                    lastHeartbeatAt = SystemClock.elapsedRealtime()
+                    scheduleHeartbeat(active)
                 }
                 while (true) {
                     val message = active.receive()
@@ -540,22 +537,42 @@ internal class ConnectionController @Inject constructor(
         if (voice?.speaker(enabled) == true) publish(state.value.copy(speaker = enabled))
     }
 
+    private fun scheduleHeartbeat(active: SignalChannel) {
+        heartbeat?.let(main::removeCallbacks)
+        val current = generation
+        val interval = if (call.id == null) IDLE_HEARTBEAT_MS else ACTIVE_HEARTBEAT_MS
+        val remaining = (interval - (SystemClock.elapsedRealtime() - lastHeartbeatAt)).coerceAtLeast(0)
+        heartbeat = Runnable {
+            heartbeat = null
+            if (current == generation && channel === active) {
+                lastHeartbeatAt = SystemClock.elapsedRealtime()
+                sendTo(active, Signal(SignalType.PING, UUID.randomUUID()))
+                scheduleHeartbeat(active)
+            }
+        }.also { main.postDelayed(it, remaining) }
+    }
+
     fun probe() {
         if (channel == null) return
+        clearProbe()
         val id = UUID.randomUUID()
         waiting = id to SystemClock.elapsedRealtime()
         send(Signal(SignalType.PING, id))
-        main.postDelayed({
-            if (waiting?.first == id) {
-                waiting = null
-                publish(state.value.copy(latency = null, status = "انتهت مهلة فحص الاتصال."))
-            }
-        }, 5_000L)
+        probeTimeout = Runnable {
+            clearProbe()
+            publish(state.value.copy(latency = null, status = "انتهت مهلة فحص الاتصال."))
+        }.also { main.postDelayed(it, 5_000L) }
+    }
+
+    private fun clearProbe() {
+        waiting = null
+        probeTimeout?.let(main::removeCallbacks)
+        probeTimeout = null
     }
 
     private fun selectPeer(number: String, target: SignalChannel?) {
         if (channel !== target || state.value.peer != number) {
-            waiting = null
+            clearProbe()
             channel = target
             publish(state.value.copy(peer = number, latency = null))
         }
@@ -624,7 +641,7 @@ internal class ConnectionController @Inject constructor(
             }
             SignalType.PING -> channel?.let { sendTo(it, Signal(SignalType.PONG, message.id)) }
             SignalType.PONG -> waiting?.takeIf { it.first == message.id }?.let {
-                waiting = null
+                clearProbe()
                 publish(state.value.copy(latency = SystemClock.elapsedRealtime() - it.second))
             }
             SignalType.OFFER, SignalType.ANSWER, SignalType.ICE -> {
@@ -669,6 +686,10 @@ internal class ConnectionController @Inject constructor(
                     }
                 }
             }
+        }
+        if ((trackedId == null) != (id == null)) {
+            if (heartbeat != null) channel?.let(::scheduleHeartbeat)
+            if (hotspotPoll != null) scheduleHotspotCheck()
         }
         if (id != trackedId || next != trackedState) {
             timer?.let(main::removeCallbacks)
@@ -724,7 +745,7 @@ internal class ConnectionController @Inject constructor(
 
     private fun disconnect(reason: String, preserveAccepted: Boolean = false) {
         channel = null
-        waiting = null
+        clearProbe()
         heartbeat?.let(main::removeCallbacks)
         heartbeat = null
         if (!internetCall) {
@@ -948,24 +969,30 @@ internal class ConnectionController @Inject constructor(
         override fun onAvailable(network: Network) = scheduleNetworkCheck()
         override fun onLost(network: Network) = scheduleNetworkCheck()
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) = scheduleNetworkCheck()
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) = scheduleNetworkCheck()
     }
 
-    private fun monitorNetwork() {
+    private fun monitorNetwork(serveHotspot: Boolean = false) {
         topology = currentTopology()
+        monitoring = true
         connectivity.registerDefaultNetworkCallback(defaultCallback)
         runCatching {
             connectivity.registerNetworkCallback(NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET).build(), lanCallback)
         }
-        monitoring = true
-        hotspotPoll = object : Runnable {
-            override fun run() {
-                if (!monitoring) return
-                if (state.value.mode == Mode.SERVER && currentTopology() != topology) scheduleNetworkCheck()
-                main.postDelayed(this, 4_000L)
-            }
-        }.also { main.postDelayed(it, 4_000L) }
+        if (serveHotspot) scheduleHotspotCheck()
+    }
+
+    // Some hotspot interfaces are not reported through ConnectivityManager.
+    private fun scheduleHotspotCheck() {
+        hotspotPoll?.let(main::removeCallbacks)
+        hotspotPoll = Runnable {
+            if (monitoring && state.value.mode == Mode.SERVER) {
+                if (currentTopology() != topology) scheduleNetworkCheck()
+                scheduleHotspotCheck()
+            } else hotspotPoll = null
+        }.also { main.postDelayed(it, if (call.id == null) IDLE_HOTSPOT_CHECK_MS else ACTIVE_HOTSPOT_CHECK_MS) }
     }
 
     private fun unmonitorNetwork() {
@@ -1067,6 +1094,11 @@ internal class ConnectionController @Inject constructor(
     }
 
     private companion object {
+        // The client read timeout is 25 seconds, including for existing peers.
+        const val IDLE_HEARTBEAT_MS = 16_000L
+        const val ACTIVE_HEARTBEAT_MS = 10_000L
+        const val IDLE_HOTSPOT_CHECK_MS = 30_000L
+        const val ACTIVE_HOTSPOT_CHECK_MS = 4_000L
         val LAN_INTERFACES = listOf("wlan", "swlan", "ap", "softap", "eth", "en", "p2p", "tun")
         val RETRY_DELAYS = listOf(2_000L, 4_000L, 8_000L)
     }

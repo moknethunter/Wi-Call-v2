@@ -17,6 +17,7 @@ internal class LanDiscovery(
     private val main = Handler(Looper.getMainLooper())
     private var registration: NsdManager.RegistrationListener? = null
     private var discovery: NsdManager.DiscoveryListener? = null
+    private var discoveryTimeout: Runnable? = null
 
     fun advertise(pin: String) {
         close()
@@ -86,12 +87,14 @@ internal class LanDiscovery(
             }
         }
         discovery = listener
+        discoveryTimeout = Runnable { listener.finish(null) }.also { main.postDelayed(it, 3_000) }
         runCatching { manager.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, listener) }
             .onFailure { listener.finish(null) }
-        main.postDelayed({ listener.finish(null) }, 3_000)
     }
 
     fun close() {
+        discoveryTimeout?.let(main::removeCallbacks)
+        discoveryTimeout = null
         discovery?.let { runCatching { manager.stopServiceDiscovery(it) } }
         registration?.let { runCatching { manager.unregisterService(it) } }
         discovery = null
