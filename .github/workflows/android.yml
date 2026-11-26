@@ -1,4 +1,4 @@
-name: Build Wi-Call APK
+name: Build Wi-Call APK with EasyTier
 
 on:
   push:
@@ -28,9 +28,9 @@ jobs:
 
   android:
     needs: directory
-    name: Test and assemble debug APK
+    name: Test and assemble debug APK with EasyTier
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Check out the repository
@@ -44,20 +44,67 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Make Android SDK 35 available
-        shell: bash
-        run: |
-          sdk="${ANDROID_HOME:?Android SDK is unavailable on this runner}"
-          if [[ ! -f "$sdk/platforms/android-35/android.jar" || ! -x "$sdk/build-tools/35.0.0/aapt2" ]]; then
-            "$sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk" "platforms;android-35" "build-tools;35.0.0"
-          fi
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android
 
-      - name: Enable Android emulator acceleration
+      - name: Install Android NDK
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Clone EasyTier source
+        run: |
+          git clone --depth 1 https://github.com/EasyTier/EasyTier.git /tmp/EasyTier
+          cd /tmp/EasyTier
+          git submodule update --init --recursive
+
+      - name: Build EasyTier FFI and JNI libraries
         shell: bash
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+          cd /tmp/EasyTier/easytier-contrib/easytier-ffi
+          cargo build --release --target aarch64-linux-android
+          cargo build --release --target armv7-linux-androideabi
+          cargo build --release --target i686-linux-android
+          cargo build --release --target x86_64-linux-android
+          cd ../easytier-android-jni
+          cargo build --release --target aarch64-linux-android
+          cargo build --release --target armv7-linux-androideabi
+          cargo build --release --target i686-linux-android
+          cargo build --release --target x86_64-linux-android
+
+      - name: Copy native libraries to jniLibs
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            case $abi in
+              arm64-v8a)   target=aarch64-linux-android ;;
+              armeabi-v7a) target=armv7-linux-androideabi ;;
+              x86)         target=i686-linux-android ;;
+              x86_64)      target=x86_64-linux-android ;;
+            esac
+            mkdir -p app/src/main/jniLibs/$abi
+            cp /tmp/EasyTier/target/$target/release/libeasytier_ffi.so app/src/main/jniLibs/$abi/ 2>/dev/null || true
+            cp /tmp/EasyTier/target/$target/release/libeasytier_android_jni.so app/src/main/jniLibs/$abi/
+          done
+
+      - name: Verify minSdkVersion is compatible with Android 10
+        shell: bash
+        run: |
+          min_sdk=$(grep -oP 'minSdkVersion\s*=\s*\K[0-9]+' app/build.gradle || true)
+          if [ -z "$min_sdk" ]; then
+            echo "minSdkVersion not found in app/build.gradle"
+            exit 1
+          fi
+          echo "Detected minSdkVersion: $min_sdk"
+          if [ "$min_sdk" -gt 29 ]; then
+            echo "::error::minSdkVersion ($min_sdk) is greater than 29. The APK will not install on Android 10."
+            exit 1
+          fi
+          echo "minSdkVersion is compatible with Android 10."
 
       - name: Verify JVM contracts, Android lint, and Android 10 behavior
         uses: reactivecircus/android-emulator-runner@v2
@@ -85,7 +132,7 @@ jobs:
       - name: Upload the signed debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: Wi-Call-Debug
+          name: Wi-Call-Debug-with-EasyTier
           path: build/outputs/apk/Wi-Call-Debug.apk
           if-no-files-found: error
           retention-days: 14
