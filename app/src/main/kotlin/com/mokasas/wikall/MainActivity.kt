@@ -222,6 +222,7 @@ class MainActivity : ComponentActivity() {
         var editDirectory by remember { mutableStateOf(false) }
         var directoryInput by remember { mutableStateOf("") }
         var localOnlyInput by remember { mutableStateOf(false) }
+        var showWifiRelay by remember { mutableStateOf(false) }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -249,6 +250,10 @@ class MainActivity : ComponentActivity() {
                     Panel("اختر دور هذا الهاتف") {
                         Action("إدارة الخادم · $HOST_NUMBER") { selectedMode = Mode.SERVER }
                         Action("الانضمام إلى خادم", true) { selectedMode = Mode.CLIENT }
+                        Action(if (showWifiRelay) "أغلق ترحيل Wi-Fi" else "ترحيل EasyTier بين شبكتي Wi-Fi", true) {
+                            showWifiRelay = !showWifiRelay
+                        }
+                        if (showWifiRelay) DualWifiRelayPanel()
                     }
                 }
                 Mode.SERVER -> {

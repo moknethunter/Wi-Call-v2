@@ -474,6 +474,13 @@ internal class ConnectionController @Inject constructor(
 
     private fun lanSocketFactory(address: String): javax.net.SocketFactory? {
         val target = InetAddress.getByName(address)
+        val active = connectivity.activeNetwork
+        if (active != null &&
+            connectivity.getNetworkCapabilities(active)?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true &&
+            connectivity.getLinkProperties(active)?.routes.orEmpty().any {
+                it.destination.prefixLength > 0 && it.destination.contains(target)
+            }
+        ) return null
         return lanNetworks()
             .flatMap { (network, properties) ->
                 properties.routes
@@ -942,7 +949,7 @@ internal class ConnectionController @Inject constructor(
     }
 
     private companion object {
-        val LAN_INTERFACES = listOf("wlan", "swlan", "ap", "softap", "eth", "en", "p2p")
+        val LAN_INTERFACES = listOf("wlan", "swlan", "ap", "softap", "eth", "en", "p2p", "tun")
         val RETRY_DELAYS = listOf(2_000L, 4_000L, 8_000L)
     }
 }
