@@ -103,10 +103,17 @@ class MainActivity : ComponentActivity() {
                 selectedMode = Mode.CLIENT
                 imported = file
                 note = ""
-                runSession { controller.connect(file.license, file.bytes) }
+                connectActivation(file)
             }.onFailure {
                 note = "رمز التفعيل غير صالح لهذا الهاتف."
             }
+        }
+    }
+
+    private fun connectActivation(file: ImportedActivation) {
+        runSession { controller.connect(file.license, file.bytes) }
+        if (file.license.overlaySecret != null) {
+            VpnService.prepare(this)?.let(overlayPermission::launch)
         }
     }
 
@@ -283,7 +290,6 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun Screen(session: SessionState) {
         val mode = session.mode.takeUnless { it == Mode.HOME } ?: selectedMode
-        var addressChoices by remember { mutableStateOf<List<String>?>(null) }
         var manualAction by remember { mutableStateOf<((String) -> Unit)?>(null) }
         var addressInput by remember { mutableStateOf("") }
         var revoke by remember { mutableStateOf<String?>(null) }
@@ -339,18 +345,9 @@ class MainActivity : ComponentActivity() {
                             Action("شاشة الاتصال") { showDialPad = true }
                         if (address == null && !session.busy && session.number == null) {
                             Action("تشغيل الخادم") {
-                                val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
-                                when (addresses.size) {
-                                    0 -> {
-                                        if (controller.internetEndpoint().isNotBlank()) runSession { controller.start(null) }
-                                        else {
-                                            addressInput = ""
-                                            manualAction = { runSession { controller.start(it) } }
-                                        }
-                                    }
-                                    1 -> runSession { controller.start(addresses.single()) }
-                                    else -> addressChoices = addresses
-                                }
+                                val address = runCatching(controller::listAddresses).getOrDefault(emptyList()).firstOrNull()
+                                runSession { controller.start(address) }
+                                VpnService.prepare(this@MainActivity)?.let(overlayPermission::launch)
                             }
                         }
                     }
@@ -426,6 +423,13 @@ class MainActivity : ComponentActivity() {
                         Panel("المكالمة") {
                             if (session.callId == null) Action("شاشة الاتصال") { showDialPad = true }
                             if (peer != null) CallPane(session, peer)
+                        }
+                        if (session.callId == null && session.onlineUsers.isNotEmpty()) {
+                            Panel("الأرقام المتصلة بالشبكة") {
+                                session.onlineUsers.sorted().forEach { number ->
+                                    Action("اتصل بـ $number", true) { withMicrophone { controller.dial(number) } }
+                                }
+                            }
                         }
                     } else if (!session.busy) {
                         Panel("تفعيل هذا الهاتف") {
@@ -535,21 +539,6 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        addressChoices?.let { items ->
-            AlertDialog(
-                onDismissRequest = { addressChoices = null },
-                title = { Text("اختر عنوان الشبكة المحلية") },
-                text = { Column {
-                    items.forEach { address ->
-                        Action(address, true) {
-                            addressChoices = null
-                            runSession { controller.start(address) }
-                        }
-                    }
-                } },
-                confirmButton = { Action("إلغاء", true) { addressChoices = null } },
-            )
-        }
         manualAction?.let { connect ->
             AlertDialog(
                 onDismissRequest = { manualAction = null },
@@ -777,7 +766,7 @@ class MainActivity : ComponentActivity() {
                     is ImportedActivation -> {
                         imported = file
                         note = ""
-                        runSession { controller.connect(file.license, file.bytes) }
+                        connectActivation(file)
                     }
                     else -> Unit
                 }

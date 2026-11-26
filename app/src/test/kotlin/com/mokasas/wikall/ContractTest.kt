@@ -76,6 +76,12 @@ class ContractTest {
         assertEquals(OVERLAY_HOST, network.first().address)
         assertEquals(network.size, network.map { it.address }.toSet().size)
         assertTrue(network.all { overlayAddress(it.address) })
+        val peers = OverlayRequest("A".repeat(64), "X".repeat(32), HOST_NUMBER,
+            "192.168.1.2", listOf("192.168.1.3", "192.168.1.2"))
+        assertEquals(
+            listOf("uri = \"udp://192.168.1.2:11010\"", "uri = \"udp://192.168.1.3:11010\""),
+            peers.configuration().lineSequence().filter { it.startsWith("uri =") }.toList(),
+        )
         assertThrows(IllegalArgumentException::class.java) {
             OverlayRequest("A".repeat(64), "X".repeat(32), HOST_NUMBER, OVERLAY_HOST)
         }
@@ -174,6 +180,11 @@ class ContractTest {
                 LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { secondClient ->
                     firstClient.connect(activation(a), first.private)
                     secondClient.connect(activation(b), second.private)
+                    firstClient.send(Signal(SignalType.PING, onlineNumbersProbe))
+                    assertEquals(
+                        Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, "$HOST_NUMBER,${a.number},${b.number}"),
+                        firstClient.receive(),
+                    )
                     val call = Signal(SignalType.INVITE, UUID.randomUUID(), number = HOST_NUMBER)
                     firstClient.send(call)
                     assertEquals(a.number to call.copy(number = a.number), seen.poll(5, TimeUnit.SECONDS))
@@ -204,6 +215,11 @@ class ContractTest {
                     secondClient.send(Signal(SignalType.PING, ping))
                     assertEquals(Signal(SignalType.PONG, ping), secondClient.receive())
                     host.revokeDevice(a.number)
+                    secondClient.send(Signal(SignalType.PING, onlineNumbersProbe))
+                    assertEquals(
+                        Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, "$HOST_NUMBER,${b.number}"),
+                        secondClient.receive(),
+                    )
                     val newPing = UUID.randomUUID()
                     secondClient.send(Signal(SignalType.PING, newPing))
                     assertEquals(Signal(SignalType.PONG, newPing), secondClient.receive())

@@ -41,19 +41,56 @@ internal class LanDiscovery(
         runCatching { manager.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
     }
 
-    fun find(pin: String, ignoredAddresses: Set<String> = emptySet(), result: (String?) -> Unit) {
+    fun find(pin: String, result: (String?) -> Unit) {
+        findPeers(pin, emptySet(), limit = 1) { result(it.firstOrNull()) }
+    }
+
+    fun findPeers(pin: String, ignoredAddresses: Set<String>, limit: Int, result: (List<String>) -> Unit) {
         close()
+        val id = discoveryId(pin)
         val listener = object : NsdManager.DiscoveryListener {
+            val addresses = linkedSetOf<String>()
+            val pending = ArrayDeque<NsdServiceInfo>()
+            val seen = mutableSetOf<String>()
             var resolving = false
 
-            fun finish(address: String?) {
+            fun finish() {
                 if (discovery !== this) return
                 close()
-                result(address)
+                result(addresses.toList())
+            }
+
+            fun resolveNext() {
+                if (discovery !== this || resolving || pending.isEmpty()) return
+                resolving = true
+                val info = pending.removeFirst()
+                val scan = this
+                val resolve = object : NsdManager.ResolveListener {
+                    override fun onResolveFailed(service: NsdServiceInfo, code: Int) {
+                        main.post { resolved(null) }
+                    }
+
+                    override fun onServiceResolved(service: NsdServiceInfo) {
+                        main.post { resolved(service) }
+                    }
+
+                    fun resolved(service: NsdServiceInfo?) {
+                        if (discovery !== scan) return
+                        resolving = false
+                        if (service != null && service.port == servicePort &&
+                            service.attributes["id"]?.decodeToString() == id) {
+                            service.host?.hostAddress?.takeIf {
+                                privateIpv4(it) && !overlayAddress(it) && it !in ignoredAddresses
+                            }?.let(addresses::add)
+                        }
+                        if (addresses.size >= limit) finish() else resolveNext()
+                    }
+                }
+                runCatching { manager.resolveService(info, resolve) }.onFailure { resolve.resolved(null) }
             }
 
             override fun onStartDiscoveryFailed(type: String, code: Int) {
-                main.post { finish(null) }
+                main.post { finish() }
             }
             override fun onStopDiscoveryFailed(type: String, code: Int) = Unit
             override fun onDiscoveryStarted(type: String) {
@@ -63,33 +100,18 @@ internal class LanDiscovery(
             override fun onServiceLost(info: NsdServiceInfo) = Unit
             override fun onServiceFound(info: NsdServiceInfo) {
                 main.post {
-                    if (discovery !== this || resolving || !info.serviceName.startsWith("$label ${discoveryId(pin).take(12)}")) {
-                        return@post
+                    if (discovery === this && seen.size < USER_LIMIT + 1 &&
+                        info.serviceName.startsWith("$label ${id.take(12)}") && seen.add(info.serviceName)) {
+                        pending.addLast(info)
+                        resolveNext()
                     }
-                    resolving = true
-                    runCatching {
-                        manager.resolveService(info, object : NsdManager.ResolveListener {
-                            override fun onResolveFailed(service: NsdServiceInfo, code: Int) {
-                                main.post { resolving = false }
-                            }
-                            override fun onServiceResolved(service: NsdServiceInfo) {
-                                main.post {
-                                    resolving = false
-                                    if (service.port == servicePort &&
-                                        service.attributes["id"]?.decodeToString() == discoveryId(pin)) {
-                                        service.host?.hostAddress?.takeIf { privateIpv4(it) && it !in ignoredAddresses }?.let(::finish)
-                                    }
-                                }
-                            }
-                        })
-                    }.onFailure { resolving = false }
                 }
             }
         }
         discovery = listener
-        discoveryTimeout = Runnable { listener.finish(null) }.also { main.postDelayed(it, 3_000) }
+        discoveryTimeout = Runnable { listener.finish() }.also { main.postDelayed(it, 3_000) }
         runCatching { manager.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, listener) }
-            .onFailure { listener.finish(null) }
+            .onFailure { listener.finish() }
     }
 
     fun close() {

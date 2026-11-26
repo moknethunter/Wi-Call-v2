@@ -78,6 +78,7 @@ internal class ConnectionController @Inject constructor(
         private set
     private var overlayIp: String? = null
     private var overlayPeer: String? = null
+    private var discoveredOverlayPeers = emptyList<String>()
     private var directory: DirectoryClient? = null
     private var directoryIdentity: Triple<String, String, java.security.PrivateKey>? = null
     private var directoryVersion = 0
@@ -281,9 +282,10 @@ internal class ConnectionController @Inject constructor(
                         overlayBootstrap().isBlank() && android.net.VpnService.prepare(context) == null
                     ) {
                         val own = runCatching(::listAddresses).getOrDefault(emptyList()).toSet()
-                        overlayDiscovery.find(saved.pin, own) { peer ->
-                            if (peer != null && current == generation && attempt == lanAttempt && channel == null) {
-                                syncClientOverlay(saved, peer)
+                        overlayDiscovery.findPeers(saved.pin, own, limit = 6) { peers ->
+                            if (peers.isNotEmpty() && current == generation && attempt == lanAttempt && !call.accepted) {
+                                discoveredOverlayPeers = peers
+                                syncClientOverlay(saved, null)
                             }
                         }
                     }
@@ -340,7 +342,8 @@ internal class ConnectionController @Inject constructor(
         if (detected != null && !overlayAddress(detected)) overlayPeer = detected
         val address = overlayBootstrap().takeIf(String::isNotBlank) ?: overlayPeer ?: saved.activation.address
         val peer = address.takeUnless(::overlayAddress)
-        openOverlay(OverlayRequest(saved.pin, secret, saved.activation.number, peer))
+        val peers = discoveredOverlayPeers.filterNot { it == peer }.sorted()
+        openOverlay(OverlayRequest(saved.pin, secret, saved.activation.number, peer, peers))
     }
 
     private fun openOverlay(request: OverlayRequest) {
@@ -420,6 +423,7 @@ internal class ConnectionController @Inject constructor(
                             }
                         }
                     }
+                    sendTo(active, Signal(SignalType.PING, onlineNumbersProbe))
                     probe()
                     if (!internetCall && call.accepted) requestRepair()
                     lastHeartbeatAt = SystemClock.elapsedRealtime()
@@ -428,7 +432,7 @@ internal class ConnectionController @Inject constructor(
                 while (true) {
                     val message = active.receive()
                     onMain(current) {
-                        if (attempt == lanAttempt && (!internetCall || message.type in setOf(SignalType.PING, SignalType.PONG)))
+                        if (attempt == lanAttempt && (!internetCall || message.type in setOf(SignalType.PING, SignalType.PONG, SignalType.ONLINE_NUMBERS)))
                             received(message)
                     }
                 }
@@ -546,7 +550,9 @@ internal class ConnectionController @Inject constructor(
             heartbeat = null
             if (current == generation && channel === active) {
                 lastHeartbeatAt = SystemClock.elapsedRealtime()
-                sendTo(active, Signal(SignalType.PING, UUID.randomUUID()))
+                val id = if (state.value.mode == Mode.CLIENT &&
+                    (call.id == null || state.value.onlineUsers.isEmpty())) onlineNumbersProbe else UUID.randomUUID()
+                sendTo(active, Signal(SignalType.PING, id))
                 scheduleHeartbeat(active)
             }
         }.also { main.postDelayed(it, remaining) }
@@ -625,6 +631,13 @@ internal class ConnectionController @Inject constructor(
             selectPeer(caller, channel)
         }
         when (message.type) {
+            SignalType.ONLINE_NUMBERS -> {
+                val session = state.value
+                if (session.mode == Mode.CLIENT && channel != null) {
+                    val numbers = message.payload.orEmpty().split(',').filter { validNumber(it) && it != session.number }
+                    publish(session.copy(onlineUsers = numbers.toSet()))
+                }
+            }
             SignalType.UNAVAILABLE -> {
                 val invite = pendingInternet?.takeIf { it.id == call.id && it.id == message.id }
                 if (!internetCall && invite != null) fallback(invite)
@@ -745,6 +758,7 @@ internal class ConnectionController @Inject constructor(
 
     private fun disconnect(reason: String, preserveAccepted: Boolean = false) {
         channel = null
+        if (state.value.mode == Mode.CLIENT) publish(state.value.copy(onlineUsers = emptySet()))
         clearProbe()
         heartbeat?.let(main::removeCallbacks)
         heartbeat = null
@@ -768,6 +782,7 @@ internal class ConnectionController @Inject constructor(
         overlayRequest = null
         overlayIp = null
         overlayPeer = null
+        discoveredOverlayPeers = emptyList()
         overlayDiscovery.close()
         overlayAnnouncement.close()
         if (hadOverlay) context.stopService(Intent(context, WikallVpnService::class.java))
@@ -1037,6 +1052,8 @@ internal class ConnectionController @Inject constructor(
                         Mode.CLIENT -> savedClient?.let {
                             if (channel == null || !call.accepted || internetCall || updated.second != previous?.second) {
                                 discovery.close()
+                                overlayPeer = null
+                                discoveredOverlayPeers = emptyList()
                                 val old = client
                                 client = null
                                 disconnect("تغيّرت الشبكة المحلية.", preserveAccepted = true)

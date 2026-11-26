@@ -5,12 +5,12 @@ internal const val OVERLAY_PREFIX = 22
 internal const val OVERLAY_HOST = "10.126.124.1"
 internal const val OVERLAY_INSTANCE = "wikall"
 
-internal data class OverlayRequest(val pin: String, val secret: String, val number: String, val peer: String?) {
+internal data class OverlayRequest(val pin: String, val secret: String, val number: String, val peer: String?, val extraPeers: List<String> = emptyList()) {
     init {
         require(pin.length == 64 && pin.all { it in '0'..'9' || it in 'A'..'F' })
         require(validNonce(secret))
         require(validNumber(number))
-        require(peer == null || privateIpv4(peer) && !overlayAddress(peer))
+        require((listOfNotNull(peer) + extraPeers).all { privateIpv4(it) && !overlayAddress(it) })
     }
 
     val address: String
@@ -33,9 +33,9 @@ internal data class OverlayRequest(val pin: String, val secret: String, val numb
         appendLine("enable_exit_node = false")
         appendLine("enable_ipv6 = false")
         appendLine("accept_dns = false")
-        if (peer != null) {
+        (listOfNotNull(peer) + extraPeers).distinct().forEach { endpoint ->
             appendLine("[[peer]]")
-            appendLine("uri = \"udp://$peer:$EASYTIER_RELAY_PORT\"")
+            appendLine("uri = \"udp://$endpoint:$EASYTIER_RELAY_PORT\"")
         }
     }
 }

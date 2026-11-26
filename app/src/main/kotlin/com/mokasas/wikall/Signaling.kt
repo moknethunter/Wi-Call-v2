@@ -23,11 +23,12 @@ import kotlin.concurrent.thread
 
 internal enum class SignalType {
     CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, UNAVAILABLE, TIMEOUT, END, OFFER, ANSWER, ICE, RESTART, REPAIR,
-    HANDOFF_REQUEST, HANDOFF_CHECK, HANDOFF_CONFIRM, HANDOFF
+    HANDOFF_REQUEST, HANDOFF_CHECK, HANDOFF_CONFIRM, HANDOFF, ONLINE_NUMBERS
 }
 
 internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null, val number: String? = null)
 internal val probeId: UUID = UUID(0, 0)
+internal val onlineNumbersProbe = UUID(0, 1)
 private const val MAX_SIGNAL_SIZE = 16 * 1024
 
 private object SignalCodec {
@@ -54,6 +55,10 @@ private object SignalCodec {
             SignalType.CHALLENGE -> require(id == probeId && payload != null && validNonce(payload))
             SignalType.AUTH -> require(id == probeId && payload != null && payload.length <= 420)
             SignalType.OFFER, SignalType.ANSWER, SignalType.ICE -> require(id != probeId && payload != null)
+            SignalType.ONLINE_NUMBERS -> require(
+                id == onlineNumbersProbe && payload != null && payload.length <= 6 * USER_LIMIT + 5 &&
+                    payload.split(',').all(::validNumber),
+            )
             else -> require(payload == null)
         }
         return Signal(type, id, payload, number)
@@ -264,8 +269,15 @@ internal class LocalHost(
             while (!closed.get()) {
                 val message = channel.receive()
                 require(message.type != SignalType.AUTH && message.type != SignalType.CHALLENGE && message.type != SignalType.READY)
-                if (message.type == SignalType.PING) channel.send(Signal(SignalType.PONG, message.id))
-                else if (message.type == SignalType.PONG) {
+                if (message.type == SignalType.ONLINE_NUMBERS) break
+                if (message.type == SignalType.PING) {
+                    if (message.id == onlineNumbersProbe) {
+                        val numbers = synchronized(leaseLock) {
+                            if (active[user] === channel) (active.keys + HOST_NUMBER).sorted().joinToString(",") else null
+                        } ?: break
+                        channel.send(Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, numbers))
+                    } else channel.send(Signal(SignalType.PONG, message.id))
+                } else if (message.type == SignalType.PONG) {
                     synchronized(leaseLock) { if (active[user] === channel) handler.onSignal(user, message) }
                 } else {
                     val routed = synchronized(leaseLock) {
