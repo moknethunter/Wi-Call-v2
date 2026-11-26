@@ -19,7 +19,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
 HOST = "99000"
-NUMBERS = {str(i) for i in range(99000, 99011)}
+NUMBERS = {str(i) for i in range(99000, 100000)}
+USER_LIMIT = 30
 TTL = 30
 RETENTION = 7 * 86400
 MEDIA = {"OFFER", "ANSWER", "ICE", "REPAIR", "RESTART"}
@@ -177,7 +178,7 @@ class Directory:
                         self.db.execute("UPDATE calls SET pushed=1 WHERE realm=? AND id=?", (realm, row["id"]))
 
     async def roster(self, realm, entries):
-        if not isinstance(entries, dict) or set(entries) - (NUMBERS - {HOST}):
+        if not isinstance(entries, dict) or len(entries) > USER_LIMIT or set(entries) - (NUMBERS - {HOST}):
             raise ValueError("Invalid roster")
         for value in entries.values():
             load_key(value)

@@ -69,7 +69,40 @@ class ContractTest {
         assertThrows(IllegalArgumentException::class.java) { packTransfer(Transfer.REQUEST, ByteArray(FILE_LIMIT + 1)) }
     }
 
-    @Test fun numbersAreStableAndLimitedToTenDistinctDevices() {
+    @Test fun overlayAddressesAreUniqueAndScopedToTheOverlay() {
+        val network = (listOf(HOST_NUMBER) + userNumbers).map {
+            OverlayRequest("A".repeat(64), "X".repeat(32), it, null)
+        }
+        assertEquals(OVERLAY_HOST, network.first().address)
+        assertEquals(network.size, network.map { it.address }.toSet().size)
+        assertTrue(network.all { overlayAddress(it.address) })
+        val peers = OverlayRequest("A".repeat(64), "X".repeat(32), HOST_NUMBER,
+            "192.168.1.2", listOf("192.168.1.3", "192.168.1.2"))
+        assertEquals(
+            listOf("uri = \"udp://192.168.1.2:11010\"", "uri = \"udp://192.168.1.3:11010\""),
+            peers.configuration().lineSequence().filter { it.startsWith("uri =") }.toList(),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            OverlayRequest("A".repeat(64), "X".repeat(32), HOST_NUMBER, OVERLAY_HOST)
+        }
+    }
+
+    @Test fun assignedNumberAndQrRemainBoundToTheRequestedDevice() {
+        val device = DeviceRequest(first.public, second.public)
+        val issued = allocate(emptyList(), device, "99937")
+        assertEquals("99937", issued.number)
+        assertThrows(IllegalArgumentException::class.java) {
+            allocate(listOf(issued), DeviceRequest(second.public, first.public), issued.number)
+        }
+        val activation = Activation("192.168.10.1", entry.certificate.publicKey, issued.number, issued.serial, issued.activationId, Wire.token())
+        val bytes = activation.export(entry.privateKey, device.encryption)
+        val qr = activationQrText(bytes)
+        assertArrayEquals(bytes, activationQrBytes(qr))
+        com.google.zxing.qrcode.QRCodeWriter().encode(qr, com.google.zxing.BarcodeFormat.QR_CODE, 0, 0)
+        assertEquals(activation, Activation.read(activationQrBytes(qr), second.private, device.serial))
+    }
+
+    @Test fun numbersAreStableAndLimitedToThirtyDistinctDevices() {
         val devices = mutableListOf<Enrollment>()
         for (index in 1..USER_LIMIT) {
             val request = DeviceRequest(keys().public, second.public)
@@ -147,6 +180,11 @@ class ContractTest {
                 LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { secondClient ->
                     firstClient.connect(activation(a), first.private)
                     secondClient.connect(activation(b), second.private)
+                    firstClient.send(Signal(SignalType.PING, onlineNumbersProbe))
+                    assertEquals(
+                        Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, "$HOST_NUMBER,${a.number},${b.number}"),
+                        firstClient.receive(),
+                    )
                     val call = Signal(SignalType.INVITE, UUID.randomUUID(), number = HOST_NUMBER)
                     firstClient.send(call)
                     assertEquals(a.number to call.copy(number = a.number), seen.poll(5, TimeUnit.SECONDS))
@@ -177,6 +215,11 @@ class ContractTest {
                     secondClient.send(Signal(SignalType.PING, ping))
                     assertEquals(Signal(SignalType.PONG, ping), secondClient.receive())
                     host.revokeDevice(a.number)
+                    secondClient.send(Signal(SignalType.PING, onlineNumbersProbe))
+                    assertEquals(
+                        Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, "$HOST_NUMBER,${b.number}"),
+                        secondClient.receive(),
+                    )
                     val newPing = UUID.randomUUID()
                     secondClient.send(Signal(SignalType.PING, newPing))
                     assertEquals(Signal(SignalType.PONG, newPing), secondClient.receive())
