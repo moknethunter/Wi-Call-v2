@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -52,6 +53,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
@@ -60,6 +62,8 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import java.util.UUID
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
@@ -74,6 +78,30 @@ class MainActivity : ComponentActivity() {
     private data class SharedDocument(val uri: Uri, val kind: Transfer)
     private var imported by mutableStateOf<ImportedActivation?>(null)
     private var request by mutableStateOf<DeviceRequest?>(null)
+    private var requestedNumber by mutableStateOf("")
+    private var activationQr by mutableStateOf<Pair<String, Bitmap>?>(null)
+
+    private val scanActivation = registerForActivityResult(ScanContract()) { result ->
+        val contents = result.contents ?: return@registerForActivityResult
+        lifecycleScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val bytes = activationQrBytes(contents)
+                    val identity = DeviceIdentity.load()
+                    ImportedActivation(Activation.read(bytes, identity.decryption, identity.request.serial), bytes)
+                }
+            }.onSuccess { file ->
+                if (controller.state.value.mode != Mode.HOME) controller.stop()
+                selectedMode = Mode.CLIENT
+                imported = file
+                note = ""
+                runSession { controller.connect(file.license, file.bytes) }
+            }.onFailure {
+                note = "رمز التفعيل غير صالح لهذا الهاتف."
+            }
+        }
+    }
+
     private var exported by mutableStateOf<SharedDocument?>(null)
     private var note by mutableStateOf("")
     private var preparingFile by mutableStateOf(false)
@@ -106,12 +134,38 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun issueAndShare(device: DeviceRequest) = prepareShare(Transfer.ACTIVATION) {
-        val (number, bytes) = controller.issue(device)
+        val (number, bytes) = controller.issue(device, requestedNumber.trim().takeIf { it.isNotEmpty() })
         val file = withContext(Dispatchers.IO) {
             writeShareFile(File(filesDir, "exports/activations/Wi-Call-$number.zip"), Transfer.ACTIVATION, bytes)
         }
         request = null
         "حُفظ ملف Wi-Call-$number.zip للمستخدم $number." to file
+    }
+
+    private fun issueQr(device: DeviceRequest) {
+        if (preparingFile) return
+        preparingFile = true
+        val preferred = requestedNumber.trim()
+        lifecycleScope.launch {
+            try {
+                val (number, bytes) = controller.issue(device, preferred)
+                val bitmap = withContext(Dispatchers.IO) {
+                    writeShareFile(File(filesDir, "exports/activations/Wi-Call-$number.zip"), Transfer.ACTIVATION, bytes)
+                    activationQrBitmap(bytes)
+                }
+                activationQr = number to bitmap
+                requestedNumber = ""
+                request = null
+            } catch (_: CapacityReached) {
+                note = "وصل الخادم إلى الحد الأقصى وهو $USER_LIMIT مستخدمًا."
+            } catch (_: IllegalArgumentException) {
+                note = "الرقم غير متاح أو لا يطابق الرقم المسجل لهذا الجهاز."
+            } catch (_: Exception) {
+                note = "تعذّر توليد رمز التفعيل."
+            } finally {
+                preparingFile = false
+            }
+        }
     }
 
     private fun shareIssued(number: String) = prepareShare(Transfer.ACTIVATION) {
@@ -147,7 +201,7 @@ class MainActivity : ComponentActivity() {
                 note = summary
                 share(document)
             } catch (_: CapacityReached) {
-                note = "وصل الخادم إلى الحد الأقصى وهو عشرة مستخدمين."
+                note = "وصل الخادم إلى الحد الأقصى وهو $USER_LIMIT مستخدمًا."
             } catch (_: Exception) {
                 note = "تعذّر إعداد الملف أو فتح المشاركة."
             } finally {
@@ -317,7 +371,13 @@ class MainActivity : ComponentActivity() {
                             Action("استيراد طلب التفعيل", true) { openRequest.launch(arrayOf("*/*")) }
                             request?.let { pending ->
                                 Text("معرّف الطلب ${pending.serial.take(12)}", style = TextStyle(textDirection = TextDirection.Content))
-                                if (session.address != null) Action("إصدار التفعيل ومشاركته") { issueAndShare(pending) }
+                                if (session.address != null) {
+                                    OutlinedTextField(requestedNumber, { requestedNumber = it },
+                                        label = { Text("رقم المستخدم · 99XXX") }, singleLine = true)
+                                    if (requestedNumber.trim() in userNumbers)
+                                        Action("توليد QR التفعيل") { issueQr(pending) }
+                                    Action("إصدار التفعيل ومشاركته", true) { issueAndShare(pending) }
+                                }
                             }
                         }
                     }
@@ -356,6 +416,10 @@ class MainActivity : ComponentActivity() {
                             exported?.takeIf { it.kind == Transfer.REQUEST }?.let { document ->
                                 Action("مشاركة طلب الجهاز", true) { share(document) }
                             }
+                            Action("مسح QR التفعيل") {
+                                scanActivation.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    .setPrompt("وجّه الكاميرا نحو رمز التفعيل").setBeepEnabled(false))
+                            }
                             Action("استيراد ملف التفعيل", true) { openActivation.launch(arrayOf("*/*")) }
                             Action("نسيان التفعيل المحفوظ", true) { controller.forget(); imported = null }
                         }
@@ -379,6 +443,15 @@ class MainActivity : ComponentActivity() {
             if (session.busy) Action("إلغاء الاتصال", true, ::leave)
             if (note.isNotBlank()) Text(note, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (mode != Mode.HOME) Action("العودة لاختيار الوضع", true, ::leave)
+        }
+
+        activationQr?.let { (number, bitmap) ->
+            AlertDialog(
+                onDismissRequest = { activationQr = null },
+                title = { Text("تفعيل $number") },
+                text = { Image(bitmap.asImageBitmap(), contentDescription = "QR التفعيل", modifier = Modifier.fillMaxWidth()) },
+                confirmButton = { Action("إغلاق", true) { activationQr = null } },
+            )
         }
 
         if (editDirectory) AlertDialog(

@@ -172,11 +172,11 @@ internal class ConnectionController @Inject constructor(
         }
     }
 
-    suspend fun issue(request: DeviceRequest): Pair<String, ByteArray> {
+    suspend fun issue(request: DeviceRequest, preferredNumber: String? = null): Pair<String, ByteArray> {
         val key = checkNotNull(identity).entry
         val address = checkNotNull(hostAddress)
         val issued = withContext(Dispatchers.IO) {
-            val device = store.issue(request)
+            val device = store.issue(request, preferredNumber)
             val activation = Activation(address, key.certificate.publicKey, device.number, device.serial, device.activationId)
             device.number to activation.export(key.privateKey, request.encryption)
         }

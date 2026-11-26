@@ -53,6 +53,7 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.activity.compose)
     implementation(libs.serialization.json)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation(libs.room.runtime)
     implementation(libs.hilt.android)
     implementation(libs.webrtc)
