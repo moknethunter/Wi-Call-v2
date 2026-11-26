@@ -64,6 +64,8 @@ internal class ConnectionController @Inject constructor(
     // Accessed only on hostControl, including while the listener is still starting.
     private var boundHost: LocalHost? = null
     private val discovery = LanDiscovery(context)
+    private val overlayDiscovery = LanDiscovery(context, "_wikall-ol._udp.", EASYTIER_RELAY_PORT, "WiKall")
+    private val overlayAnnouncement = LanDiscovery(context, "_wikall-ol._udp.", EASYTIER_RELAY_PORT, "WiKall")
     @Volatile private var generation = 0
     private var host: LocalHost? = null
     private var client: LocalClient? = null
@@ -250,6 +252,7 @@ internal class ConnectionController @Inject constructor(
     private fun locate(saved: SavedConnection, manual: Boolean) {
         savedClient = saved
         val attempt = ++lanAttempt
+        overlayDiscovery.close()
         publish(state.value.copy(mode = Mode.CLIENT, busy = true, address = saved.address, number = saved.activation.number, status = "جارٍ البحث عن الخادم المحلي…"))
         if (directoryIdentity == null) {
             val current = generation
@@ -272,6 +275,16 @@ internal class ConnectionController @Inject constructor(
             discovery.find(saved.pin) { address ->
                 if (current == generation && attempt == lanAttempt) {
                     syncClientOverlay(saved, address)
+                    if (address == null && saved.activation.overlaySecret != null &&
+                        overlayBootstrap().isBlank() && android.net.VpnService.prepare(context) == null
+                    ) {
+                        val own = runCatching(::listAddresses).getOrDefault(emptyList()).toSet()
+                        overlayDiscovery.find(saved.pin, own) { peer ->
+                            if (peer != null && current == generation && attempt == lanAttempt && channel == null) {
+                                syncClientOverlay(saved, peer)
+                            }
+                        }
+                    }
                     val gateways = runCatching(::lanGateways).getOrDefault(emptyList())
                     val candidates = lanCandidates(address, gateways, saved.address, saved.activation.address)
                         .filterNot(::overlayAddress) + overlayFallback(null)
@@ -340,7 +353,12 @@ internal class ConnectionController @Inject constructor(
         if (overlayRequest != request) return
         val firstReady = overlayIp == null && address != null
         overlayIp = address
-        if (address == null) overlayRequest = null
+        if (address == null) {
+            overlayRequest = null
+            overlayAnnouncement.close()
+        } else {
+            overlayAnnouncement.advertise(request.pin)
+        }
         val attached = runCatching { host?.setOverlayAddress(address) }.isSuccess
         val status = when {
             address == null -> "تعذّر تشغيل شبكة EasyTier أو تم إيقافها."
@@ -729,6 +747,8 @@ internal class ConnectionController @Inject constructor(
         overlayRequest = null
         overlayIp = null
         overlayPeer = null
+        overlayDiscovery.close()
+        overlayAnnouncement.close()
         if (hadOverlay) context.stopService(Intent(context, WikallVpnService::class.java))
         unmonitorNetwork()
         directoryVersion++

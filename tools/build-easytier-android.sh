@@ -19,9 +19,9 @@ test "$(git -C "$source_dir" rev-parse HEAD)" = 8428a89d2dabc94c97d370ec607c6ca1
 
 cd "$source_dir"
 rustup target add "$target"
-cargo ndk -t "$abi" -p 29 build --locked --release -p easytier-ffi
+cargo ndk -t "$abi" --platform 29 build --locked --release -p easytier-ffi
 native_path="$source_dir/target/$target/release"
-cargo ndk -t "$abi" -p 29 rustc --locked --release -p easytier-android-jni -- \
+cargo ndk -t "$abi" --platform 29 rustc --locked --release -p easytier-android-jni -- \
     -L "native=$native_path" -l dylib=easytier_ffi -C link-arg=-Wl,-z,defs
 
 mkdir -p "$output/$abi"
