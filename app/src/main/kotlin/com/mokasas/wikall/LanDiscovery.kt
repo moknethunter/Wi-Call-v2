@@ -7,11 +7,17 @@ import android.os.Handler
 import android.os.Looper
 
 @Suppress("DEPRECATION")
-internal class LanDiscovery(context: Context) {
+internal class LanDiscovery(
+    context: Context,
+    private val type: String = "_mokasas._tcp.",
+    private val servicePort: Int = PORT,
+    private val label: String = "Wi-Call",
+) {
     private val manager = context.getSystemService(NsdManager::class.java)
     private val main = Handler(Looper.getMainLooper())
     private var registration: NsdManager.RegistrationListener? = null
     private var discovery: NsdManager.DiscoveryListener? = null
+    private var discoveryTimeout: Runnable? = null
 
     fun advertise(pin: String) {
         close()
@@ -27,15 +33,15 @@ internal class LanDiscovery(context: Context) {
         }
         registration = listener
         val info = NsdServiceInfo().apply {
-            serviceName = "Wi-Call ${discoveryId(pin).take(12)}"
-            serviceType = TYPE
-            port = PORT
+            serviceName = "$label ${discoveryId(pin).take(12)}"
+            serviceType = type
+            port = servicePort
             setAttribute("id", discoveryId(pin))
         }
         runCatching { manager.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
     }
 
-    fun find(pin: String, result: (String?) -> Unit) {
+    fun find(pin: String, ignoredAddresses: Set<String> = emptySet(), result: (String?) -> Unit) {
         close()
         val listener = object : NsdManager.DiscoveryListener {
             var resolving = false
@@ -57,7 +63,7 @@ internal class LanDiscovery(context: Context) {
             override fun onServiceLost(info: NsdServiceInfo) = Unit
             override fun onServiceFound(info: NsdServiceInfo) {
                 main.post {
-                    if (discovery !== this || resolving || !info.serviceName.startsWith("Wi-Call ${discoveryId(pin).take(12)}")) {
+                    if (discovery !== this || resolving || !info.serviceName.startsWith("$label ${discoveryId(pin).take(12)}")) {
                         return@post
                     }
                     resolving = true
@@ -69,9 +75,9 @@ internal class LanDiscovery(context: Context) {
                             override fun onServiceResolved(service: NsdServiceInfo) {
                                 main.post {
                                     resolving = false
-                                    if (service.port == PORT &&
+                                    if (service.port == servicePort &&
                                         service.attributes["id"]?.decodeToString() == discoveryId(pin)) {
-                                        service.host?.hostAddress?.takeIf(::privateIpv4)?.let(::finish)
+                                        service.host?.hostAddress?.takeIf { privateIpv4(it) && it !in ignoredAddresses }?.let(::finish)
                                     }
                                 }
                             }
@@ -81,19 +87,18 @@ internal class LanDiscovery(context: Context) {
             }
         }
         discovery = listener
-        runCatching { manager.discoverServices(TYPE, NsdManager.PROTOCOL_DNS_SD, listener) }
+        discoveryTimeout = Runnable { listener.finish(null) }.also { main.postDelayed(it, 3_000) }
+        runCatching { manager.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, listener) }
             .onFailure { listener.finish(null) }
-        main.postDelayed({ listener.finish(null) }, 3_000)
     }
 
     fun close() {
+        discoveryTimeout?.let(main::removeCallbacks)
+        discoveryTimeout = null
         discovery?.let { runCatching { manager.stopServiceDiscovery(it) } }
         registration?.let { runCatching { manager.unregisterService(it) } }
         discovery = null
         registration = null
     }
 
-    private companion object {
-        const val TYPE = "_mokasas._tcp."
-    }
 }

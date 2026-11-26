@@ -124,18 +124,36 @@ internal class LocalHost(
         { task -> Thread(task, "wi-call-peer").apply { isDaemon = true } },
     )
 
-    private val listener = (context.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
-        try {
-            enabledProtocols = supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
-            reuseAddress = true
-            bind(InetSocketAddress(address, listenPort), 8)
-        } catch (failure: Exception) {
-            close()
-            throw failure
+    private val tlsContext = context
+    private val primaryAddress = address
+    private val listener = listen(address, listenPort)
+    private var overlayListener: SSLServerSocket? = null
+    private var overlayAddress: String? = null
+
+    private fun listen(address: String, port: Int) =
+        (tlsContext.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
+            try {
+                enabledProtocols = supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
+                reuseAddress = true
+                bind(InetSocketAddress(address, port), 8)
+            } catch (failure: Exception) {
+                close()
+                throw failure
+            }
         }
-    }
 
     val localPort: Int get() = listener.localPort
+
+    fun setOverlayAddress(address: String?) = synchronized(leaseLock) {
+        if (closed.get() || address == overlayAddress || address == primaryAddress) return@synchronized
+        runCatching { overlayListener?.close() }
+        overlayListener = null
+        overlayAddress = null
+        if (address == null) return@synchronized
+        val handler = callbacks ?: return@synchronized
+        overlayListener = listen(address, localPort).also { acceptConnections(it, handler) }
+        overlayAddress = address
+    }
 
     fun revokeDevice(number: String) {
         val (peer, ended) = synchronized(leaseLock) {
@@ -173,10 +191,14 @@ internal class LocalHost(
         check(serving.compareAndSet(false, true))
         val handler = Callbacks(onReady, onSignal, onEnded)
         callbacks = handler
+        acceptConnections(listener, handler)
+    }
+
+    private fun acceptConnections(socketListener: SSLServerSocket, handler: Callbacks) {
         thread(name = "wi-call-listener", isDaemon = true) {
             while (!closed.get()) {
                 val socket = try {
-                    listener.accept() as SSLSocket
+                    socketListener.accept() as SSLSocket
                 } catch (_: IOException) {
                     return@thread
                 }
@@ -303,6 +325,9 @@ internal class LocalHost(
             routes.clear()
             departures.values.forEach { it.cancel(false) }
             departures.clear()
+            runCatching { overlayListener?.close() }
+            overlayListener = null
+            overlayAddress = null
             accepted.toList()
         }
         runCatching(listener::close)
