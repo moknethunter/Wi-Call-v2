@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
+import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.util.AtomicFile
@@ -52,14 +54,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextDirection
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import java.util.UUID
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
@@ -74,6 +80,45 @@ class MainActivity : ComponentActivity() {
     private data class SharedDocument(val uri: Uri, val kind: Transfer)
     private var imported by mutableStateOf<ImportedActivation?>(null)
     private var request by mutableStateOf<DeviceRequest?>(null)
+    private var requestedNumber by mutableStateOf("")
+    private var activationQr by mutableStateOf<Pair<String, Bitmap>?>(null)
+
+    private val overlayPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (it.resultCode == RESULT_OK) {
+            controller.refreshOverlay()
+            note = "سُمح بتشغيل EasyTier مع تفعيل WiKall."
+        } else note = "يمكن متابعة الاتصال المحلي العادي والإنترنت الاحتياطي."
+    }
+
+    private val scanActivation = registerForActivityResult(ScanContract()) { result ->
+        val contents = result.contents ?: return@registerForActivityResult
+        lifecycleScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val bytes = activationQrBytes(contents)
+                    val identity = DeviceIdentity.load()
+                    ImportedActivation(Activation.read(bytes, identity.decryption, identity.request.serial), bytes)
+                }
+            }.onSuccess { file ->
+                if (controller.state.value.mode != Mode.HOME) controller.stop()
+                selectedMode = Mode.CLIENT
+                imported = file
+                note = ""
+                connectActivation(file)
+            }.onFailure {
+                note = "رمز التفعيل غير صالح لهذا الهاتف."
+            }
+        }
+    }
+
+    private fun connectActivation(file: ImportedActivation) {
+        getPreferences(MODE_PRIVATE).edit().remove("resumeHost").apply()
+        runSession { controller.connect(file.license, file.bytes) }
+        if (file.license.overlaySecret != null) {
+            VpnService.prepare(this)?.let(overlayPermission::launch)
+        }
+    }
+
     private var exported by mutableStateOf<SharedDocument?>(null)
     private var note by mutableStateOf("")
     private var preparingFile by mutableStateOf(false)
@@ -106,12 +151,38 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun issueAndShare(device: DeviceRequest) = prepareShare(Transfer.ACTIVATION) {
-        val (number, bytes) = controller.issue(device)
+        val (number, bytes) = controller.issue(device, requestedNumber.trim().takeIf { it.isNotEmpty() })
         val file = withContext(Dispatchers.IO) {
             writeShareFile(File(filesDir, "exports/activations/Wi-Call-$number.zip"), Transfer.ACTIVATION, bytes)
         }
         request = null
         "حُفظ ملف Wi-Call-$number.zip للمستخدم $number." to file
+    }
+
+    private fun issueQr(device: DeviceRequest) {
+        if (preparingFile) return
+        preparingFile = true
+        val preferred = requestedNumber.trim()
+        lifecycleScope.launch {
+            try {
+                val (number, bytes) = controller.issue(device, preferred)
+                val bitmap = withContext(Dispatchers.IO) {
+                    writeShareFile(File(filesDir, "exports/activations/Wi-Call-$number.zip"), Transfer.ACTIVATION, bytes)
+                    activationQrBitmap(bytes)
+                }
+                activationQr = number to bitmap
+                requestedNumber = ""
+                request = null
+            } catch (_: CapacityReached) {
+                note = "وصل الخادم إلى الحد الأقصى وهو $USER_LIMIT مستخدمًا."
+            } catch (_: IllegalArgumentException) {
+                note = "الرقم غير متاح أو لا يطابق الرقم المسجل لهذا الجهاز."
+            } catch (_: Exception) {
+                note = "تعذّر توليد رمز التفعيل."
+            } finally {
+                preparingFile = false
+            }
+        }
     }
 
     private fun shareIssued(number: String) = prepareShare(Transfer.ACTIVATION) {
@@ -147,7 +218,7 @@ class MainActivity : ComponentActivity() {
                 note = summary
                 share(document)
             } catch (_: CapacityReached) {
-                note = "وصل الخادم إلى الحد الأقصى وهو عشرة مستخدمين."
+                note = "وصل الخادم إلى الحد الأقصى وهو $USER_LIMIT مستخدمًا."
             } catch (_: Exception) {
                 note = "تعذّر إعداد الملف أو فتح المشاركة."
             } finally {
@@ -188,6 +259,18 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (savedInstanceState == null) handleIntent(intent)
+        if (savedInstanceState == null && intent.action == Intent.ACTION_MAIN) {
+            if (getPreferences(MODE_PRIVATE).getBoolean("resumeHost", false) &&
+                controller.state.value.mode == Mode.HOME && selectedMode == Mode.HOME) {
+                startHost(requestVpn = false)
+            } else {
+                lifecycleScope.launch {
+                    if (controller.hasSavedActivation() && controller.state.value.mode == Mode.HOME && selectedMode == Mode.HOME) {
+                        runSession { controller.reconnect() }
+                    }
+                }
+            }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -214,13 +297,14 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun Screen(session: SessionState) {
         val mode = session.mode.takeUnless { it == Mode.HOME } ?: selectedMode
-        var addressChoices by remember { mutableStateOf<List<String>?>(null) }
         var manualAction by remember { mutableStateOf<((String) -> Unit)?>(null) }
         var addressInput by remember { mutableStateOf("") }
         var revoke by remember { mutableStateOf<String?>(null) }
         var showDialPad by remember { mutableStateOf(false) }
-        var editDirectory by remember { mutableStateOf(false) }
-        var directoryInput by remember { mutableStateOf("") }
+        var showChat by remember(mode) { mutableStateOf(false) }
+        var editOverlay by remember { mutableStateOf(false) }
+        var overlayBootstrapInput by remember { mutableStateOf("") }
+        var overlayPassphrase by remember { mutableStateOf("") }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -235,7 +319,7 @@ class MainActivity : ComponentActivity() {
                 Image(painterResource(R.drawable.ic_wikall), contentDescription = null, modifier = Modifier.size(52.dp))
                 Column {
                     Text(getString(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
-                    Text(if (session.internetReady) "الاتصال عبر الإنترنت جاهز" else "مكالمات Wi-Call",
+                    Text("اتصال محلي",
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
@@ -254,29 +338,10 @@ class MainActivity : ComponentActivity() {
                             Text("$address:$PORT", style = TextStyle(textDirection = TextDirection.Ltr))
                             Text("المتصلون ${session.onlineUsers.size} · الأرقام المخصصة ${session.devices.size} من $USER_LIMIT")
                         }
-                        if ((address != null || session.internetReady) && session.callId == null)
+                        if (address != null && session.callId == null)
                             Action("شاشة الاتصال") { showDialPad = true }
                         if (address == null && !session.busy && session.number == null) {
-                            Action("تشغيل الخادم") {
-                                val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
-                                when (addresses.size) {
-                                    0 -> {
-                                        if (controller.internetEndpoint().isNotBlank()) runSession { controller.start(null) }
-                                        else {
-                                            addressInput = ""
-                                            manualAction = { runSession { controller.start(it) } }
-                                        }
-                                    }
-                                    1 -> runSession { controller.start(addresses.single()) }
-                                    else -> addressChoices = addresses
-                                }
-                            }
-                        }
-                    }
-                    session.publicKey?.let { key ->
-                        Action("نسخ المفتاح العام لإعداد خدمة الإنترنت", true) {
-                            getSystemService(android.content.ClipboardManager::class.java)
-                                .setPrimaryClip(android.content.ClipData.newPlainText("Wi-Call public key", key))
+                            Action("تشغيل الخادم") { startHost() }
                         }
                     }
                     session.peer?.takeIf { session.callState != CallState.IDLE }?.let { peer ->
@@ -295,7 +360,7 @@ class MainActivity : ComponentActivity() {
                                     },
                                     style = MaterialTheme.typography.titleMedium,
                                 )
-                                if (!user.revoked && (connected || session.internetReady) && session.callId == null) {
+                                if (!user.revoked && connected && session.callId == null) {
                                     Action("اتصل بـ ${user.number}") { withMicrophone { controller.dial(user.number) } }
                                 }
                                 if (!user.revoked) {
@@ -307,7 +372,13 @@ class MainActivity : ComponentActivity() {
                             Action("استيراد طلب التفعيل", true) { openRequest.launch(arrayOf("*/*")) }
                             request?.let { pending ->
                                 Text("معرّف الطلب ${pending.serial.take(12)}", style = TextStyle(textDirection = TextDirection.Content))
-                                if (session.address != null) Action("إصدار التفعيل ومشاركته") { issueAndShare(pending) }
+                                if (session.address != null) {
+                                    OutlinedTextField(requestedNumber, { requestedNumber = it },
+                                        label = { Text("رقم المستخدم · 99XXX") }, singleLine = true)
+                                    if (requestedNumber.trim() in userNumbers)
+                                        Action("توليد QR التفعيل") { issueQr(pending) }
+                                    Action("إصدار التفعيل ومشاركته", true) { issueAndShare(pending) }
+                                }
                             }
                         }
                     }
@@ -335,10 +406,17 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
-                    if (peer != null || session.internetReady && !session.busy) {
+                    if (peer != null) {
                         Panel("المكالمة") {
                             if (session.callId == null) Action("شاشة الاتصال") { showDialPad = true }
                             if (peer != null) CallPane(session, peer)
+                        }
+                        if (session.callId == null && session.onlineUsers.isNotEmpty()) {
+                            Panel("الأرقام المتصلة بالشبكة") {
+                                session.onlineUsers.sorted().forEach { number ->
+                                    Action("اتصل بـ $number", true) { withMicrophone { controller.dial(number) } }
+                                }
+                            }
                         }
                     } else if (!session.busy) {
                         Panel("تفعيل هذا الهاتف") {
@@ -346,42 +424,83 @@ class MainActivity : ComponentActivity() {
                             exported?.takeIf { it.kind == Transfer.REQUEST }?.let { document ->
                                 Action("مشاركة طلب الجهاز", true) { share(document) }
                             }
+                            Action("مسح QR التفعيل") {
+                                scanActivation.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    .setPrompt("وجّه الكاميرا نحو رمز التفعيل").setBeepEnabled(false))
+                            }
                             Action("استيراد ملف التفعيل", true) { openActivation.launch(arrayOf("*/*")) }
                             Action("نسيان التفعيل المحفوظ", true) { controller.forget(); imported = null }
                         }
                     }
                 }
             }
+            if (session.number != null && session.callId == null) {
+                Action(if (showChat) "إخفاء الرسائل" else "الرسائل المحلية", true) { showChat = !showChat }
+                if (showChat) LocalChatPanel(session.number)
+            }
             if (session.missed.isNotEmpty()) Panel("المكالمات الفائتة") {
                 session.missed.forEach { item ->
                     val time = android.text.format.DateUtils.getRelativeTimeSpanString(item.endedAt)
                     Text("${item.peer} · $time")
-                    if (session.callId == null && (session.internetReady || session.address != null && session.peer != null)) {
+                    if (session.callId == null && session.address != null && session.peer != null) {
                         Action("اتصل بـ ${item.peer}", true) { withMicrophone { controller.dial(item.peer) } }
                     }
+                    Action("تمت القراءة", true) { controller.markMissedRead(item.id) }
                 }
             }
-            if (session.callId == null) Action("إعداد الاتصال عبر الإنترنت", true) {
-                directoryInput = controller.internetEndpoint()
-                editDirectory = true
+            if (session.overlayStatus.isNotBlank()) Text(session.overlayStatus)
+            if (session.callId == null) Action("إعداد شبكة EasyTier المحلية", true) {
+                overlayBootstrapInput = controller.overlayBootstrap()
+                overlayPassphrase = ""
+                editOverlay = true
             }
             if (session.busy) Action("إلغاء الاتصال", true, ::leave)
             if (note.isNotBlank()) Text(note, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (mode != Mode.HOME) Action("العودة لاختيار الوضع", true, ::leave)
         }
 
-        if (editDirectory) AlertDialog(
-            onDismissRequest = { editDirectory = false },
-            title = { Text("خدمة الاتصال عبر الإنترنت") },
-            text = { OutlinedTextField(directoryInput, { directoryInput = it },
-                label = { Text("رابط HTTPS للخدمة") }, singleLine = true) },
-            confirmButton = {
-                Button(enabled = directoryInput.isBlank() || directoryUrl(directoryInput) != null, onClick = {
-                    controller.configureInternet(directoryInput)
-                    editDirectory = false
-                }) { Text("حفظ") }
+        activationQr?.let { (number, bitmap) ->
+            AlertDialog(
+                onDismissRequest = { activationQr = null },
+                title = { Text("تفعيل $number") },
+                text = { Image(bitmap.asImageBitmap(), contentDescription = "QR التفعيل", modifier = Modifier.fillMaxWidth()) },
+                confirmButton = { Action("إغلاق", true) { activationQr = null } },
+            )
+        }
+
+        if (editOverlay) AlertDialog(
+            onDismissRequest = { editOverlay = false; overlayPassphrase = "" },
+            title = { Text("شبكة WiKall التراكبية") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("يعلن WiKall الشبكة ويبحث عن أجهزة المجموعة تلقائيًا على الوصلات المحلية.")
+                    if (mode == Mode.SERVER && controller.canCreateOverlaySecret()) {
+                        OutlinedTextField(overlayPassphrase, { if (it.length <= 128) overlayPassphrase = it },
+                            label = { Text("كلمة مرور المجموعة الجديدة · اختياري") },
+                            visualTransformation = PasswordVisualTransformation(), singleLine = true)
+                    }
+                    OutlinedTextField(overlayBootstrapInput, { overlayBootstrapInput = it },
+                        label = { Text("عنوان IPv4 لعقدة محلية · اختياري") }, singleLine = true)
+                }
             },
-            dismissButton = { Action("إلغاء", true) { editDirectory = false } },
+            confirmButton = {
+                val endpoint = overlayBootstrapInput.trim()
+                val validPassphrase = overlayPassphrase.isEmpty() || overlayPassphrase.length >= 12 && overlayPassphrase.isNotBlank()
+                Button(enabled = validPassphrase && (endpoint.isBlank() || privateIpv4(endpoint) && !overlayAddress(endpoint)), onClick = {
+                    if (overlayPassphrase.isNotEmpty() && !controller.setInitialOverlayPassphrase(overlayPassphrase)) {
+                        note = "تعذّر حفظ كلمة المرور. إذا كانت المجموعة موجودة فستبقى بياناتها الحالية."
+                        overlayPassphrase = ""
+                        editOverlay = false
+                        return@Button
+                    }
+                    overlayPassphrase = ""
+                    controller.configureOverlayBootstrap(endpoint)
+                    editOverlay = false
+                    val permission = VpnService.prepare(this@MainActivity)
+                    if (permission == null) controller.refreshOverlay() else overlayPermission.launch(permission)
+                }) { Text("حفظ وتفعيل") }
+            },
+            dismissButton = { Action("إلغاء", true) { editOverlay = false; overlayPassphrase = "" } },
         )
 
         if (showDialPad) {
@@ -395,21 +514,6 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        addressChoices?.let { items ->
-            AlertDialog(
-                onDismissRequest = { addressChoices = null },
-                title = { Text("اختر عنوان الشبكة المحلية") },
-                text = { Column {
-                    items.forEach { address ->
-                        Action(address, true) {
-                            addressChoices = null
-                            runSession { controller.start(address) }
-                        }
-                    }
-                } },
-                confirmButton = { Action("إلغاء", true) { addressChoices = null } },
-            )
-        }
         manualAction?.let { connect ->
             AlertDialog(
                 onDismissRequest = { manualAction = null },
@@ -432,6 +536,32 @@ class MainActivity : ComponentActivity() {
                 confirmButton = { Action("إلغاء التفعيل") { revoke = null; controller.revoke(number) } },
                 dismissButton = { Action("رجوع", true) { revoke = null } },
             )
+        }
+    }
+
+    @Composable
+    private fun LocalChatPanel(ownNumber: String) {
+        val chat by controller.chat.state.collectAsState()
+        var number by remember(ownNumber) { mutableStateOf("") }
+        var draft by remember(ownNumber) { mutableStateOf("") }
+        Panel("الرسائل المحلية") {
+            OutlinedTextField(number, { number = it.filter { digit -> digit in '0'..'9' }.take(5) },
+                label = { Text("رقم المستلم") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            chat.items.filter { !validNumber(number) || it.peer == number }.take(20).asReversed().forEach { item ->
+                val direction = if (item.outgoing) "إلى ${item.peer}" else "من ${item.peer}"
+                val status = if (item.outgoing && !item.accepted) " · غير مؤكدة" else ""
+                Text("$direction$status", style = MaterialTheme.typography.labelMedium)
+                Text(item.body)
+                HorizontalDivider()
+            }
+            OutlinedTextField(draft, { if (it.encodeToByteArray().size <= CHAT_TEXT_BYTES) draft = it },
+                label = { Text("اكتب رسالة") }, maxLines = 4, modifier = Modifier.fillMaxWidth())
+            Button(
+                onClick = { if (controller.chat.send(number, draft)) draft = "" },
+                enabled = chat.available && !chat.sending && validNumber(number) && number != ownNumber && draft.isNotBlank(),
+            ) { Text(if (chat.sending) "جارٍ الإرسال…" else "إرسال") }
+            if (!chat.available) Text("اتصل بالدليل المحلي لإرسال الرسائل.")
+            if (chat.notice.isNotBlank()) Text(chat.notice)
         }
     }
 
@@ -469,6 +599,8 @@ class MainActivity : ComponentActivity() {
         }
         if (status.isNotEmpty()) Text(status)
         val id = session.callId
+        session.mediaPath?.let { Text("مسار الصوت · ${it.label}") }
+        if (session.mediaPath == null) session.path?.let { Text("مسار الإشارات · ${it.label}") }
         if (session.callState == CallState.RINGING) {
             Action("قبول") {
                 withMicrophone {
@@ -584,7 +716,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun startHost(requestVpn: Boolean = true) {
+        val address = runCatching(controller::listAddresses).getOrDefault(emptyList()).firstOrNull()
+        runSession {
+            controller.start(address)
+            getPreferences(MODE_PRIVATE).edit().putBoolean("resumeHost", true).apply()
+        }
+        if (requestVpn) VpnService.prepare(this)?.let(overlayPermission::launch)
+    }
+
     private fun leave() {
+        getPreferences(MODE_PRIVATE).edit().remove("resumeHost").apply()
         controller.stop()
         stopService(Intent(this, LocalServerForegroundService::class.java))
         selectedMode = Mode.HOME
@@ -596,7 +738,6 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun handleIntent(intent: Intent) {
-        if (intent.getStringExtra("wi_missed") == "1") runSession(controller::resumeMissed)
         val uri = when (intent.action) {
             Intent.ACTION_VIEW -> intent.data
             Intent.ACTION_SEND -> if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
@@ -636,7 +777,7 @@ class MainActivity : ComponentActivity() {
                     is ImportedActivation -> {
                         imported = file
                         note = ""
-                        runSession { controller.connect(file.license, file.bytes) }
+                        connectActivation(file)
                     }
                     else -> Unit
                 }

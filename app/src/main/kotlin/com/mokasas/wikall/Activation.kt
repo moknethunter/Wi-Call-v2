@@ -20,9 +20,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 
 internal const val HOST_NUMBER = "99000"
-internal const val USER_LIMIT = 10
+internal const val USER_LIMIT = 30
 internal const val FILE_LIMIT = 12 * 1024
-internal val userNumbers = (99001..99010).map(Int::toString)
+internal val userNumbers = (99001..99999).map(Int::toString)
 
 internal data class DeviceRequest(val signing: PublicKey, val encryption: PublicKey) {
     val serial: String get() = Wire.pin(signing)
@@ -58,39 +58,60 @@ internal data class Enrollment(
     val encryption: String,
     val activationId: String,
     val revoked: Boolean = false,
+    val expiresAt: Long? = null,
+    val activated: Boolean = false,
 )
 
 internal class CapacityReached : IllegalStateException("Wi-Call enrollment capacity reached")
 
 // Revoked entries retain their number, so a saved contact never changes owner.
-internal fun allocate(existing: List<Enrollment>, request: DeviceRequest): Enrollment {
+internal fun allocate(existing: List<Enrollment>, request: DeviceRequest, preferredNumber: String? = null): Enrollment {
     val previous = existing.firstOrNull { it.serial == request.serial }
     val signing = Wire.encode(request.signing.encoded)
     val encryption = Wire.encode(request.encryption.encoded)
-    if (previous != null && !previous.revoked && previous.encryption == encryption) return previous
-    val number = previous?.number ?: userNumbers.firstOrNull { candidate -> existing.none { it.number == candidate } }
-        ?: throw CapacityReached()
-    return Enrollment(number, request.serial, signing, encryption, Wire.token())
+    require(preferredNumber == null || preferredNumber in userNumbers)
+    require(previous == null || preferredNumber == null || preferredNumber == previous.number)
+    if (previous != null && !previous.revoked && previous.encryption == encryption &&
+        (previous.expiresAt == null || previous.expiresAt > System.currentTimeMillis())
+    ) return previous
+    if (previous == null && existing.size >= USER_LIMIT) throw CapacityReached()
+    val number = previous?.number ?: preferredNumber ?: userNumbers.first { candidate ->
+        existing.none { it.number == candidate }
+    }
+    require(existing.none { it.number == number && it.serial != request.serial }) { "Number already assigned" }
+    return Enrollment(number, request.serial, signing, encryption, Wire.token(), expiresAt =
+        System.currentTimeMillis() + 365L * 24 * 60 * 60 * 1000)
 }
 
 internal data class Activation(
-    val address: String,
+    val address: String?,
     val server: PublicKey,
     val number: String,
     val serial: String,
     val id: String,
+    val overlaySecret: String? = null,
+    val expiresAt: Long? = null,
+    val overlayEpoch: Long = 0,
 ) {
     val pin: String get() = Wire.pin(server)
+
+    fun canRefreshOverlay(previous: Activation): Boolean =
+        pin == previous.pin && number == previous.number && serial == previous.serial &&
+            id == previous.id && expiresAt == previous.expiresAt && overlaySecret != null &&
+            (overlayEpoch > previous.overlayEpoch || previous.overlaySecret == null && overlayEpoch == previous.overlayEpoch)
 
     fun export(hostKey: PrivateKey, recipient: PublicKey): ByteArray {
         val body = buildJsonObject {
             put("type", "wi-call-activation-1")
-            put("address", address)
+            address?.let { put("address", it) }
+            expiresAt?.let { put("expiresAt", it) }
             put("server", Wire.encode(server.encoded))
             put("serverAlgorithm", server.algorithm)
             put("number", number)
             put("serial", serial)
             put("id", id)
+            overlaySecret?.let { put("overlaySecret", it) }
+            if (overlayEpoch > 0) put("overlayEpoch", overlayEpoch)
         }.bytes()
         val aes = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
         val payload = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, aes) }
@@ -123,11 +144,17 @@ internal data class Activation(
             if (server is java.security.interfaces.ECPublicKey) require(server.params.curve.field.fieldSize == 256)
             require(Wire.verified(server, body, Wire.decode(envelope.value("signature"))))
             require(decoded.value("type") == "wi-call-activation-1")
-            val address = decoded.value("address")
+            val address = decoded["address"]?.jsonPrimitive?.content?.takeIf(::privateIpv4)
+            val expiresAt = decoded["expiresAt"]?.jsonPrimitive?.content?.let { it.toLong() }
+            require(expiresAt == null || expiresAt > System.currentTimeMillis()) { "Activation expired" }
             val number = decoded.value("number")
             val id = decoded.value("id")
-            require(privateIpv4(address) && number in userNumbers && decoded.value("serial") == serial && validNonce(id))
-            return Activation(address, server, number, serial, id)
+            require(number in userNumbers && decoded.value("serial") == serial && validNonce(id))
+            val secret = decoded["overlaySecret"]?.jsonPrimitive?.content
+            require(secret == null || validNonce(secret))
+            val epoch = decoded["overlayEpoch"]?.jsonPrimitive?.content?.toLong() ?: 0L
+            require(epoch >= 0 && (epoch == 0L || secret != null))
+            return Activation(address, server, number, serial, id, secret, expiresAt, epoch)
         }
     }
 }
@@ -140,6 +167,11 @@ internal fun activationProof(pin: String, number: String, id: String, challenge:
     return "Wi-Call device authentication 1\n$pin\n$number\n$id\n$challenge".encodeToByteArray()
 }
 
+internal fun resumeProof(pin: String, number: String, challenge: String): ByteArray {
+    require(number in userNumbers && validNonce(challenge))
+    return "WiKall activated device 1\n$pin\n$number\n$challenge".encodeToByteArray()
+}
+
 internal fun validNonce(value: String): Boolean = value.length == 32 &&
     value.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '-' || it == '_' }
 
@@ -149,7 +181,7 @@ internal fun publicKey(encoded: String): PublicKey {
     return key
 }
 
-private fun rsa(mode: Int, key: java.security.Key) = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding").apply {
+internal fun rsa(mode: Int, key: java.security.Key) = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding").apply {
     init(mode, key, OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA1, PSource.PSpecified.DEFAULT))
 }
 

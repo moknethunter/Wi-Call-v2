@@ -8,7 +8,8 @@ plugins {
 
 tasks.register<Copy>("assembleDebug") {
     dependsOn(":app:assembleDebug")
-    from(layout.projectDirectory.file("app/build/outputs/apk/debug/app-debug.apk"))
+    from(layout.projectDirectory.file("app/build/outputs/apk/debug/app-debug.apk")) {
+        rename { "Wi-Call-v2-Offline-Debug.apk" }
+    }
     into(layout.buildDirectory.dir("outputs/apk"))
-    rename { "Wi-Call-Debug.apk" }
 }

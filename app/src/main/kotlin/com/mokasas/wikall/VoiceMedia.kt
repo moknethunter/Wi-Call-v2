@@ -28,13 +28,23 @@ import livekit.org.webrtc.RtpTransceiver
 import livekit.org.webrtc.SessionDescription
 import livekit.org.webrtc.audio.JavaAudioDeviceModule
 
+internal data class MediaPathSample(
+    val localIp: String,
+    val remoteIp: String,
+    val roundTripMs: Long?,
+    val lossFraction: Double?,
+    val jitterMs: Double?,
+)
+
 internal class VoiceMedia(
     private val context: Context,
     private val send: (SignalType, String) -> Unit,
     private val onState: (CallState) -> Unit,
     private val onFailure: () -> Unit,
-    private val iceServers: List<InternetIce>? = null,
+    private val localAddresses: () -> List<String>,
+    private val allowsRemoteAddress: (String) -> Boolean = ::privateIpv4,
     private val onIceState: (String) -> Unit = {},
+    private val onStats: (MediaPathSample) -> Unit = {},
 ) : AutoCloseable {
     private val main = Handler(Looper.getMainLooper())
     private val audio = context.getSystemService(AudioManager::class.java)
@@ -49,6 +59,7 @@ internal class VoiceMedia(
     private var muted = false
     private var restarting = false
     private var remoteDescription: String? = null
+    private var statsTask: Runnable? = null
     private val focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
         .setAudioAttributes(AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
@@ -79,23 +90,18 @@ internal class VoiceMedia(
             val options = PeerConnectionFactory.Options().apply {
                 // Android's network monitor can omit the downstream interface of a phone hotspot.
                 // Enumerate interfaces directly for local ICE, which still publishes only private IPv4.
-                disableNetworkMonitor = iceServers == null
-                networkIgnoreMask = if (iceServers == null) {
-                    PeerConnectionFactory.Options.ADAPTER_TYPE_CELLULAR or PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
-                } else PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
+                disableNetworkMonitor = true
+                networkIgnoreMask = PeerConnectionFactory.Options.ADAPTER_TYPE_CELLULAR or
+                    PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
             }
             PeerConnectionFactory.builder().setOptions(options).setAudioDeviceModule(device).createPeerConnectionFactory()
         } finally {
             device.release()
         }
         factory = engine
-        val servers = iceServers.orEmpty().map {
-            require(Regex("(stun|stuns|turn|turns):[^\\s/]+").matches(it.url))
-            PeerConnection.IceServer.builder(it.url).setUsername(it.username).setPassword(it.credential).createIceServer()
-        }
-        val config = PeerConnection.RTCConfiguration(servers).apply {
+        val config = PeerConnection.RTCConfiguration(emptyList()).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-            if (iceServers == null) tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED
+            tcpCandidatePolicy = PeerConnection.TcpCandidatePolicy.DISABLED
         }
         val connection = checkNotNull(engine.createPeerConnection(config, observer))
         peer = connection
@@ -181,11 +187,18 @@ internal class VoiceMedia(
         if (remoteTracks.add(remote)) applyFocus()
     }
 
-    private fun validCandidate(candidate: String) = if (iceServers == null) lanIce(candidate) else internetIce(candidate)
+    private fun validCandidate(candidate: String) =
+        lanIce(candidate) && allowsRemoteAddress(candidate.split(' ')[4])
+
+    private fun allowedLocalCandidate(candidate: String): Boolean {
+        if (!lanIce(candidate)) return false
+        return candidate.split(' ')[4] in localAddresses()
+    }
 
     override fun close() {
         if (closed) return
         closed = true
+        stopSampling()
         track?.setEnabled(false)
         remoteTracks.clear()
         if (Build.VERSION.SDK_INT >= 31 && oldMode != null) audio.clearCommunicationDevice()
@@ -197,6 +210,38 @@ internal class VoiceMedia(
         oldMode?.let { audio.mode = it }
     }
 
+    private fun startSampling() {
+        stopSampling()
+        statsTask = Runnable {
+            statsTask = null
+            val connection = peer ?: return@Runnable
+            connection.getStats { report ->
+                active {
+                    val stats = report.statsMap
+                    val transport = stats.values.firstOrNull { it.type == "transport" }
+                    val pair = stats[transport?.members?.get("selectedCandidatePairId") as? String]?.members
+                    val local = stats[pair?.get("localCandidateId") as? String]?.members?.get("address") as? String
+                    val remote = stats[pair?.get("remoteCandidateId") as? String]?.members?.get("address") as? String
+                    val inbound = stats.values.firstOrNull { it.type == "inbound-rtp" }?.members
+                    val received = (inbound?.get("packetsReceived") as? Number)?.toDouble()
+                    val lost = (inbound?.get("packetsLost") as? Number)?.toDouble()?.coerceAtLeast(0.0)
+                    val loss = if (received != null && lost != null && received + lost > 0) lost / (received + lost) else null
+                    if (local != null && remote != null) {
+                        onStats(MediaPathSample(local, remote,
+                            (pair?.get("currentRoundTripTime") as? Number)?.toDouble()?.times(1000)?.toLong(),
+                            loss, (inbound?.get("jitter") as? Number)?.toDouble()?.times(1000)))
+                    }
+                    if (connection.connectionState() == PeerConnection.PeerConnectionState.CONNECTED) startSampling()
+                }
+            }
+        }.also { main.postDelayed(it, 5_000L) }
+    }
+
+    private fun stopSampling() {
+        statsTask?.let(main::removeCallbacks)
+        statsTask = null
+    }
+
     private fun active(action: () -> Unit) {
         main.post { if (!closed) action() }
     }
@@ -204,9 +249,9 @@ internal class VoiceMedia(
     private fun createSdp(type: SignalType) = object : SdpObserver {
         override fun onCreateSuccess(description: SessionDescription) = active {
             val sanitized = description.description.lineSequence()
-                .filterNot { it.startsWith("a=candidate:") && !validCandidate(it.removePrefix("a=")) }
+                .filterNot { it.startsWith("a=candidate:") && !allowedLocalCandidate(it.removePrefix("a=")) }
                 .joinToString("\r\n")
-            if (!audioOnly(sanitized, ::validCandidate)) {
+            if (!audioOnly(sanitized, ::allowedLocalCandidate)) {
                 onFailure()
                 return@active
             }
@@ -240,16 +285,19 @@ internal class VoiceMedia(
                 PeerConnection.PeerConnectionState.CONNECTED -> {
                     restarting = false
                     onState(CallState.CONNECTED)
+                    startSampling()
                 }
-                PeerConnection.PeerConnectionState.DISCONNECTED -> onState(CallState.RECONNECTING)
-                PeerConnection.PeerConnectionState.FAILED -> onState(CallState.RECONNECTING)
+                PeerConnection.PeerConnectionState.DISCONNECTED, PeerConnection.PeerConnectionState.FAILED -> {
+                    stopSampling()
+                    onState(CallState.RECONNECTING)
+                }
                 else -> Unit
             }
         }
         override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
         override fun onIceGatheringChange(state: PeerConnection.IceGatheringState?) = Unit
         override fun onIceCandidate(candidate: IceCandidate) = active {
-            if (!validCandidate(candidate.sdp)) return@active
+            if (!allowedLocalCandidate(candidate.sdp)) return@active
             val payload = buildJsonObject {
                 put("mid", candidate.sdpMid)
                 put("index", candidate.sdpMLineIndex)
@@ -286,14 +334,6 @@ internal fun lanIce(candidate: String): Boolean {
     return fields.size >= 8 && fields[1] == "1" && fields[2].equals("udp", ignoreCase = true) &&
         privateIpv4(fields[4]) && (fields[5].toIntOrNull() ?: 0) in 1..65535 &&
         fields[6] == "typ" && fields[7] == "host"
-}
-
-internal fun internetIce(candidate: String): Boolean {
-    if (candidate.length > 800 || '\r' in candidate || '\n' in candidate || !candidate.startsWith("candidate:")) return false
-    val fields = candidate.split(' ')
-    return fields.size >= 8 && fields[1] == "1" && fields[2].lowercase() in setOf("udp", "tcp") &&
-        Regex("[a-zA-Z0-9:.%-]{1,128}").matches(fields[4]) && (fields[5].toIntOrNull() ?: 0) in 1..65535 &&
-        fields[6] == "typ" && fields[7] in setOf("host", "srflx", "prflx", "relay")
 }
 
 internal fun audioOnly(sdp: String, candidateAllowed: (String) -> Boolean = ::lanIce): Boolean {

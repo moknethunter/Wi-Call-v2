@@ -69,7 +69,67 @@ class ContractTest {
         assertThrows(IllegalArgumentException::class.java) { packTransfer(Transfer.REQUEST, ByteArray(FILE_LIMIT + 1)) }
     }
 
-    @Test fun numbersAreStableAndLimitedToTenDistinctDevices() {
+    @Test fun groupPassphraseDoesNotCreateTheSameSecretForSeparateGroups() {
+        val passphrase = "fixture-only passphrase"
+        val firstGroup = newOverlaySecret(passphrase)
+        val secondGroup = newOverlaySecret(passphrase)
+        assertTrue(validNonce(firstGroup))
+        assertTrue(validNonce(secondGroup))
+        assertNotEquals(firstGroup, secondGroup)
+        assertThrows(IllegalArgumentException::class.java) { newOverlaySecret("short") }
+    }
+
+    @Test fun overlayAddressesAreUniqueAndScopedToTheOverlay() {
+        val network = (listOf(HOST_NUMBER) + userNumbers).map {
+            OverlayRequest("A".repeat(64), "X".repeat(32), it, null)
+        }
+        assertEquals(OVERLAY_HOST, network.first().address)
+        assertEquals(network.size, network.map { it.address }.toSet().size)
+        assertTrue(network.all { overlayAddress(it.address) })
+        val peers = OverlayRequest("A".repeat(64), "X".repeat(32), HOST_NUMBER,
+            "192.168.1.2", listOf("192.168.1.3", "192.168.1.2"))
+        assertEquals(
+            listOf("uri = \"udp://192.168.1.2:11010\"", "uri = \"udp://192.168.1.3:11010\""),
+            peers.configuration().lineSequence().filter { it.startsWith("uri =") }.toList(),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            OverlayRequest("A".repeat(64), "X".repeat(32), HOST_NUMBER, OVERLAY_HOST)
+        }
+    }
+
+    @Test fun localOverlayHasNoRendezvousOrDefaultRoute() {
+        val profile = OverlayRequest("A".repeat(64), "X".repeat(32), "99001", "192.168.1.3",
+            listenerAddresses = listOf("192.168.1.2")).configuration()
+        assertTrue("stun_servers = []" in profile)
+        assertTrue("enable_exit_node = false" in profile)
+        assertTrue("disable_udp_hole_punching = true" in profile)
+        assertTrue("disable_tcp_hole_punching = true" in profile)
+        assertTrue("udp://192.168.1.2:$OVERLAY_PORT" in profile)
+        assertFalse("0.0.0.0" in profile)
+    }
+
+    @Test fun sourceRouteChecksNonOctetSubnetPrefixes() {
+        val local = java.net.InetAddress.getByName("192.168.5.132").address
+        assertTrue(sameIpv4Subnet(local, java.net.InetAddress.getByName("192.168.5.190").address, 26))
+        assertFalse(sameIpv4Subnet(local, java.net.InetAddress.getByName("192.168.5.192").address, 26))
+    }
+
+    @Test fun assignedNumberAndQrRemainBoundToTheRequestedDevice() {
+        val device = DeviceRequest(first.public, second.public)
+        val issued = allocate(emptyList(), device, "99937")
+        assertEquals("99937", issued.number)
+        assertThrows(IllegalArgumentException::class.java) {
+            allocate(listOf(issued), DeviceRequest(second.public, first.public), issued.number)
+        }
+        val activation = Activation("192.168.10.1", entry.certificate.publicKey, issued.number, issued.serial, issued.activationId, Wire.token())
+        val bytes = activation.export(entry.privateKey, device.encryption)
+        val qr = activationQrText(bytes)
+        assertArrayEquals(bytes, activationQrBytes(qr))
+        com.google.zxing.qrcode.QRCodeWriter().encode(qr, com.google.zxing.BarcodeFormat.QR_CODE, 0, 0)
+        assertEquals(activation, Activation.read(activationQrBytes(qr), second.private, device.serial))
+    }
+
+    @Test fun numbersAreStableAndLimitedToThirtyDistinctDevices() {
         val devices = mutableListOf<Enrollment>()
         for (index in 1..USER_LIMIT) {
             val request = DeviceRequest(keys().public, second.public)
@@ -132,10 +192,24 @@ class ContractTest {
         val registry = object : EnrollmentRegistry {
             override fun find(number: String) = users[number]
             override fun revoke(number: String) { users[number]?.let { users[number] = it.copy(revoked = true) } }
+            override fun redeem(number: String, id: String): Boolean {
+                val user = users[number] ?: return false
+                if (user.activationId != id || user.activated || user.revoked) return false
+                users[number] = user.copy(activated = true)
+                return true
+            }
         }
-        fun activation(user: Enrollment) = Activation("192.168.10.1", pub, user.number, user.serial, user.activationId)
+        fun activation(user: Enrollment) = Activation(null, pub, user.number, user.serial, user.activationId,
+            expiresAt = user.expiresAt)
         val seen = LinkedBlockingQueue<Pair<String, Signal>>()
-        LocalHost(context, "127.0.0.1", 0, registry, Wire.pin(pub)).use { host ->
+        val epoch = java.util.concurrent.atomic.AtomicLong()
+        val initialSecret = Wire.token()
+        val rotatedSecret = Wire.token()
+        LocalHost(context, "127.0.0.1", 0, registry, Wire.pin(pub), overlayProfile = { device ->
+            val version = epoch.get()
+            activation(device).copy(overlaySecret = if (version == 0L) initialSecret else rotatedSecret, overlayEpoch = version)
+                .export(entry.privateKey, publicKey(device.encryption))
+        }).use { host ->
             host.serve({ _, _ -> }, { number, signal -> seen.add(number to signal) }, {})
             LocalClient("127.0.0.1", "F".repeat(64), host.localPort).use { client ->
                 assertThrows(IOException::class.java) { client.connect(activation(a), first.private) }
@@ -147,6 +221,17 @@ class ContractTest {
                 LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { secondClient ->
                     firstClient.connect(activation(a), first.private)
                     secondClient.connect(activation(b), second.private)
+                    LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { replay ->
+                        assertThrows(IOException::class.java) {
+                            replay.connect(activation(a).copy(expiresAt = null), first.private)
+                        }
+                    }
+
+                    firstClient.send(Signal(SignalType.PING, onlineNumbersProbe))
+                    assertEquals(
+                        Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, "$HOST_NUMBER,${a.number},${b.number}"),
+                        firstClient.receive(),
+                    )
                     val call = Signal(SignalType.INVITE, UUID.randomUUID(), number = HOST_NUMBER)
                     firstClient.send(call)
                     assertEquals(a.number to call.copy(number = a.number), seen.poll(5, TimeUnit.SECONDS))
@@ -162,7 +247,8 @@ class ContractTest {
                     firstClient.send(offer)
                     assertEquals(offer, secondClient.receive())
                     firstClient.close()
-                    LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { reconnected ->
+                    host.setDirectAddress("127.0.0.2")
+                    LocalClient("127.0.0.2", Wire.pin(pub), host.localPort).use { reconnected ->
                         reconnected.connect(activation(a), first.private)
                         val repair = Signal(SignalType.REPAIR, peerCall.id)
                         secondClient.send(repair)
@@ -176,16 +262,222 @@ class ContractTest {
                     val ping = UUID.randomUUID()
                     secondClient.send(Signal(SignalType.PING, ping))
                     assertEquals(Signal(SignalType.PONG, ping), secondClient.receive())
+
+                    fun readOverlayProfile(): Activation {
+                        val frame = secondClient.receive()
+                        assertEquals(SignalType.OVERLAY_PROFILE, frame.type)
+                        assertEquals(overlayProfileProbe, frame.id)
+                        val profile = Wire.decode(checkNotNull(frame.payload))
+                        assertThrows(Exception::class.java) { Activation.read(profile, first.private, a.serial) }
+                        return Activation.read(profile, second.private, b.serial)
+                    }
+                    secondClient.send(Signal(SignalType.PING, overlayProfileProbe))
+                    val initial = readOverlayProfile()
+                    assertEquals(initialSecret, initial.overlaySecret)
                     host.revokeDevice(a.number)
+                    epoch.incrementAndGet()
+                    host.refreshOverlayProfiles()
+                    val renewed = readOverlayProfile()
+                    assertEquals(rotatedSecret, renewed.overlaySecret)
+                    assertTrue(renewed.canRefreshOverlay(initial))
+                    assertFalse(initial.canRefreshOverlay(renewed))
+                    assertFalse(renewed.copy(id = Wire.token()).canRefreshOverlay(initial))
+                    secondClient.send(Signal(SignalType.PING, onlineNumbersProbe))
+                    assertEquals(
+                        Signal(SignalType.ONLINE_NUMBERS, onlineNumbersProbe, "$HOST_NUMBER,${b.number}"),
+                        secondClient.receive(),
+                    )
                     val newPing = UUID.randomUUID()
                     secondClient.send(Signal(SignalType.PING, newPing))
                     assertEquals(Signal(SignalType.PONG, newPing), secondClient.receive())
                 }
             }
-            LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { client ->
+            LocalClient("127.0.0.2", Wire.pin(pub), host.localPort).use { client ->
                 assertThrows(IOException::class.java) { client.connect(activation(a), first.private) }
             }
         }
+    }
+
+    @Test fun transportLifecycleUsesTheRealSocketAndReleasesIt(): Unit = kotlinx.coroutines.runBlocking {
+        val public = entry.certificate.publicKey
+        val enrolled = allocate(emptyList(), DeviceRequest(first.public, first.public)).copy(expiresAt = null)
+        val activation = Activation(null, public, enrolled.number, enrolled.serial, enrolled.activationId)
+        val registry = object : EnrollmentRegistry {
+            override fun find(number: String) = enrolled.takeIf { it.number == number }
+            override fun revoke(number: String) = Unit
+        }
+        LocalHost(ServerIdentity(entry).tls(), "127.0.0.1", 0, registry, activation.pin).use { master ->
+            master.serve({ _, _ -> }, { _, _ -> }, {})
+            val client = LocalClient("127.0.0.1", activation.pin, master.localPort)
+            val transport = object : LocalSignalingTransport(TransportType.HOTSPOT, client, activation, first.private) {}
+            assertEquals(TransportState.IDLE, transport.observeState().value)
+            transport.start().getOrThrow()
+            assertEquals(TransportState.READY, transport.observeState().value)
+            val ping = UUID.randomUUID()
+            client.send(Signal(SignalType.PING, ping))
+            assertEquals(Signal(SignalType.PONG, ping), client.receive())
+            transport.stop().getOrThrow()
+            assertEquals(TransportState.IDLE, transport.observeState().value)
+            assertThrows(IOException::class.java) { client.send(Signal(SignalType.PING, ping)) }
+        }
+    }
+
+    @Test fun aRejectedInterfaceCannotReachTlsEnrollment() {
+        val public = entry.certificate.publicKey
+        val enrolled = allocate(emptyList(), DeviceRequest(first.public, first.public)).copy(expiresAt = null)
+        val activation = Activation(null, public, enrolled.number, enrolled.serial, enrolled.activationId)
+        val authenticated = LinkedBlockingQueue<String>()
+        val registry = object : EnrollmentRegistry {
+            override fun find(number: String) = enrolled.takeIf { it.number == number }
+            override fun revoke(number: String) = Unit
+        }
+        LocalHost(ServerIdentity(entry).tls(), "127.0.0.1", 0, registry, activation.pin,
+            acceptsLocalPeer = { local, peer -> local == "127.0.0.2" && peer == "127.0.0.1" },
+        ).use { master ->
+            assertEquals(setOf("127.0.0.1", "127.0.0.2"), master.setDirectAddresses(listOf("127.0.0.1", "127.0.0.2")))
+            master.serve({ user, _ -> authenticated.add(user) }, { _, _ -> }, {})
+            LocalClient("127.0.0.1", activation.pin, master.localPort).use { rejected ->
+                assertThrows(IOException::class.java) { rejected.connect(activation, first.private) }
+            }
+            assertNull(authenticated.poll())
+            LocalClient("127.0.0.2", activation.pin, master.localPort).use { local ->
+                local.connect(activation, first.private)
+                assertEquals(enrolled.number, authenticated.poll(5, TimeUnit.SECONDS))
+            }
+        }
+    }
+
+    @Test fun authenticatedLocalDirectoryDeliversAndAcknowledgesQueuedMissedCalls() {
+        val hostKey = entry.certificate.publicKey
+        val caller = allocate(emptyList(), DeviceRequest(first.public, first.public)).copy(expiresAt = null)
+        val callee = allocate(listOf(caller), DeviceRequest(second.public, second.public)).copy(expiresAt = null)
+        val pending = mutableMapOf<UUID, Signal>()
+        val registry = object : EnrollmentRegistry {
+            override fun find(number: String) = listOf(caller, callee).firstOrNull { it.number == number }
+            override fun revoke(number: String) = Unit
+            override fun enqueueMissed(realm: String, number: String, call: UUID, caller: String) {
+                if (number == callee.number) pending[call] = Signal(SignalType.MISSED_CALL, call, "$caller,12345")
+            }
+            override fun pendingMissed(realm: String, number: String) =
+                if (number == callee.number) pending.values.toList() else emptyList()
+            override fun ackMissed(realm: String, number: String, call: UUID) {
+                if (number == callee.number) pending.remove(call)
+            }
+        }
+        fun activation(user: Enrollment) = Activation(null, hostKey, user.number, user.serial, user.activationId)
+        val pin = Wire.pin(hostKey)
+        LocalHost(ServerIdentity(entry).tls(), "127.0.0.1", 0, registry, pin).use { host ->
+            host.serve({ _, _ -> }, { _, _ -> }, {})
+            LocalClient("127.0.0.1", pin, host.localPort).use { source ->
+                source.connect(activation(caller), first.private)
+                val calls = List(2) { UUID.randomUUID() }
+                calls.forEach { id ->
+                    source.send(Signal(SignalType.INVITE, id, number = callee.number))
+                    assertEquals(Signal(SignalType.UNAVAILABLE, id), source.receive())
+                }
+                LocalClient("127.0.0.1", pin, host.localPort).use { target ->
+                    target.connect(activation(callee), second.private)
+                    target.send(Signal(SignalType.PING, missedCallsProbe))
+                    repeat(2) {
+                        val event = target.receive()
+                        assertEquals(SignalType.MISSED_CALL, event.type)
+                        assertTrue(event.id in calls)
+                        target.send(Signal(SignalType.MISSED_ACK, event.id))
+                    }
+                    target.send(Signal(SignalType.PING, missedCallsProbe))
+                    val ping = UUID.randomUUID()
+                    target.send(Signal(SignalType.PING, ping))
+                    assertEquals(Signal(SignalType.PONG, ping), target.receive())
+                }
+            }
+        }
+    }
+
+    @Test fun localChatQueuesOnlyCiphertextAndDeliversToItsAuthenticatedRecipient() {
+        val server = entry.certificate.publicKey
+        val pin = Wire.pin(server)
+        val source = allocate(emptyList(), DeviceRequest(first.public, first.public)).copy(expiresAt = null)
+        val target = allocate(listOf(source), DeviceRequest(second.public, second.public)).copy(expiresAt = null)
+        val registry = object : EnrollmentRegistry {
+            override fun find(number: String) = listOf(source, target).firstOrNull { it.number == number }
+            override fun revoke(number: String) = Unit
+        }
+        val packets = LinkedBlockingQueue<ChatPacket>()
+        val ledger = object : ChatLedger {
+            override fun queueChat(packet: ChatPacket): ChatQueueResult {
+                packets.add(packet)
+                return ChatQueueResult.NEW
+            }
+            override fun pendingChat(realm: String, number: String) = packets.filter { it.realm == realm && it.recipient == number }
+            override fun ackChat(realm: String, number: String, sender: String, id: String) {
+                packets.removeIf { it.realm == realm && it.recipient == number && it.sender == sender && it.id == id }
+            }
+        }
+        fun activation(user: Enrollment) = Activation(null, server, user.number, user.serial, user.activationId)
+        val chat = LocalChatRelay(pin, registry, ledger, DeviceRequest(first.public, first.public))
+        LocalHost(ServerIdentity(entry).tls(), "127.0.0.1", 0, registry, pin, chat = chat).use { host ->
+            host.serve({ _, _ -> }, { _, _ -> }, {})
+            LocalClient("127.0.0.1", pin, host.localPort).use { sender ->
+                sender.connect(activation(source), first.private)
+                sender.send(Signal(SignalType.PING, chatProbe))
+                assertEquals(Signal(SignalType.CHAT_READY, chatProbe), sender.receive())
+                val id = UUID.randomUUID()
+                sender.send(Signal(SignalType.CHAT_KEY_REQUEST, id, number = target.number))
+                val key = sender.receive()
+                assertEquals(SignalType.CHAT_KEY, key.type)
+                assertEquals(target.number, key.number)
+                val address = ChatAddress(pin, source.number, target.number, id)
+                val text = "رسالة WiKall محلية"
+                val envelope = ChatEnvelope.seal(address, text, publicKey(checkNotNull(key.payload)), first.private)
+                assertFalse(envelope.contains(text))
+                val wrongId = UUID.randomUUID()
+                sender.send(Signal(SignalType.CHAT_SEND, wrongId, envelope, target.number))
+                assertEquals(Signal(SignalType.CHAT_DECLINED, wrongId), sender.receive())
+                assertTrue(packets.isEmpty())
+                sender.send(Signal(SignalType.CHAT_SEND, id, envelope, target.number))
+                assertEquals(Signal(SignalType.CHAT_ACCEPTED, id), sender.receive())
+                assertEquals(envelope, packets.single().envelope)
+                assertThrows(Exception::class.java) { ChatEnvelope.open(address, envelope, first.public, first.private) }
+
+                sender.send(Signal(SignalType.CHAT_ACK, id, number = source.number))
+                val barrier = UUID.randomUUID()
+                sender.send(Signal(SignalType.PING, barrier))
+                assertEquals(Signal(SignalType.PONG, barrier), sender.receive())
+                assertEquals(1, packets.size)
+
+                LocalClient("127.0.0.1", pin, host.localPort).use { recipient ->
+                    recipient.connect(activation(target), second.private)
+                    recipient.send(Signal(SignalType.PING, chatProbe))
+                    assertEquals(Signal(SignalType.CHAT_READY, chatProbe), recipient.receive())
+                    val delivery = recipient.receive()
+                    assertEquals(SignalType.CHAT_DELIVERY, delivery.type)
+                    assertEquals(id, delivery.id)
+                    assertEquals(source.number, delivery.number)
+                    val payload = checkNotNull(delivery.payload)
+                    assertEquals(text, ChatEnvelope.open(address, payload.substringAfter('.'),
+                        publicKey(payload.substringBefore('.')), second.private))
+                    recipient.send(Signal(SignalType.CHAT_ACK, id, number = source.number))
+                    recipient.send(Signal(SignalType.PING, barrier))
+                    assertEquals(Signal(SignalType.PONG, barrier), recipient.receive())
+                    assertTrue(packets.isEmpty())
+                }
+            }
+        }
+    }
+
+    @Test fun losingACalleeDuringRingingProducesOneMissedDelivery() {
+        val routes = NumberRouting()
+        val id = UUID.randomUUID()
+        val from = "99001"
+        val to = "99002"
+        val invite = Signal(SignalType.INVITE, id, number = to)
+        assertNotNull(routes.receive(from, invite) { true })
+        val missed = mutableListOf<Pair<UUID, String>>()
+        val ended = routes.disconnected(to) { lost, caller -> missed.add(lost to caller) }
+        assertEquals(Signal(SignalType.END, id), ended?.message)
+        assertNull(routes.disconnected(to) { lost, caller -> missed.add(lost to caller) })
+        assertNull(routes.receive(from, invite) { true })
+        assertEquals(listOf(id to from), missed)
     }
 
     @Test fun routesEachNumberAndRejectsThirdPartyCallSignals() {
@@ -207,15 +499,47 @@ class ContractTest {
         assertEquals(SignalType.UNAVAILABLE, routing.receive(a, absent) { false }?.message?.type)
     }
 
-    @Test fun internetAllowsTurnWhileLanRejectsIt() {
+    @org.junit.Ignore("Requires internet — future phase")
+    @Test fun internetCallingIsOutsideTheOfflineBuild() = Unit
+
+    @Test fun authenticatedFrameSequenceRejectsDuplicatesAndTimeRegression() {
+        var now = 20L
+        val sender = SequencedFrames { now }
+        val receiver = SequencedFrames { 700L }
+        val first = sender.encode("payload")
+        assertEquals("payload", receiver.decode(first))
+        assertThrows(IllegalArgumentException::class.java) { receiver.decode(first) }
+        now = 35L
+        assertEquals("new", receiver.decode(sender.encode("new")))
+        assertThrows(IllegalArgumentException::class.java) { receiver.decode("5|3|1|old timestamp") }
+        assertThrows(IllegalArgumentException::class.java) { receiver.decode("5|4|99|skipped sequence") }
+    }
+
+    @Test fun localOnlyIceRejectsTurnAndPublicHosts() {
         val relay = "candidate:1 1 UDP 1 203.0.113.10 45000 typ relay"
-        assertTrue(internetIce(relay))
+        val publicHost = "candidate:1 1 UDP 1 203.0.113.10 45000 typ host"
         assertFalse(lanIce(relay))
-        assertFalse(internetIce("candidate:1 1 UDP 1 203.0.113.10 0 typ relay"))
-        val sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=$relay"
-        assertTrue(audioOnly(sdp, ::internetIce))
-        assertFalse(audioOnly(sdp))
-        assertFalse(audioOnly("$sdp\r\nm=video 9 UDP/TLS/RTP/SAVPF 98", ::internetIce))
+        assertFalse(lanIce(publicHost))
+        assertFalse(audioOnly("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=$relay"))
+    }
+
+    @Test fun activationWithoutAddressCanBeReadAndExpiredActivationIsRejected() {
+        val request = DeviceRequest(first.public, second.public)
+        val device = allocate(emptyList(), request)
+        val activation = Activation(null, entry.certificate.publicKey, device.number, device.serial, device.activationId,
+            expiresAt = device.expiresAt)
+        val current = activation.export(entry.privateKey, second.public)
+        assertEquals(activation, Activation.read(current, second.private, device.serial))
+        val expired = activation.copy(expiresAt = 1).export(entry.privateKey, second.public)
+        assertThrows(IllegalArgumentException::class.java) { Activation.read(expired, second.private, device.serial) }
+    }
+
+    @Test fun localFailoverOrdersLanThenHotspotThenOverlay() {
+        val source = java.net.InetAddress.getByName("192.168.1.2")
+        val lan = RouteCandidate("192.168.1.4", LocalPath.LAN_DIRECT, source, null)
+        val hotspot = RouteCandidate("192.168.1.9", LocalPath.HOTSPOT_DIRECT, source, null)
+        val overlay = RouteCandidate(OVERLAY_HOST, LocalPath.OVERLAY_LOCAL, source, null)
+        assertEquals(listOf(lan, hotspot, overlay), prioritizeRoutes(listOf(overlay, hotspot, lan, lan)))
     }
 
     @Test fun mediaRequiresAnAcceptedInvitationAndOnlySupportsLanAudio() {

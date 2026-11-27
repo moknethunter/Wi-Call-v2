@@ -4,7 +4,7 @@ import java.util.UUID
 
 internal enum class CallState { IDLE, CALLING, RINGING, ACCEPTED, CONNECTING, CONNECTED, RECONNECTING, FAILED, REJECTED, MISSED, BUSY, UNAVAILABLE, ENDED }
 
-internal class LocalCall {
+internal class CallSessionManager {
     var id: UUID? = null
         private set
     var state: CallState = CallState.IDLE
@@ -89,3 +89,5 @@ internal class LocalCall {
         if (recent.size > 256) recent.remove(recent.first())
     }
 }
+
+internal typealias LocalCall = CallSessionManager

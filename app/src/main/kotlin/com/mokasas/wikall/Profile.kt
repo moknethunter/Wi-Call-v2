@@ -47,7 +47,16 @@ internal fun privateIpv4(address: String): Boolean {
 }
 
 // The activation's address is a hint. Every candidate still uses the pinned server key.
-internal fun lanCandidates(discovered: String?, gateways: List<String>, previous: String, issued: String): List<String> =
-    (listOfNotNull(discovered) + gateways + listOf(previous, issued))
+internal fun lanCandidates(discovered: String?, gateways: List<String>, previous: String?, issued: String?): List<String> =
+    (listOfNotNull(discovered) + gateways + listOfNotNull(previous, issued))
         .filter(::privateIpv4)
         .distinct()
+
+internal fun sameIpv4Subnet(first: ByteArray, second: ByteArray, prefix: Int): Boolean {
+    require(first.size == 4 && second.size == 4 && prefix in 0..32)
+    return first.indices.all { index ->
+        val bits = (prefix - index * 8).coerceIn(0, 8)
+        val mask = (0xff shl (8 - bits)) and 0xff
+        (first[index].toInt() xor second[index].toInt()) and mask == 0
+    }
+}

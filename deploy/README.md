@@ -20,3 +20,47 @@ A WireGuard tunnel needs a reachable path between the gateways. Without an Inter
 ## Release acceptance
 
 Run the CI Python and Android tests. Before a release, test upgrades in place from the deployed signing identity and keep the original activation files and Android Keystore. Confirm two physical Android phones can both hear audio on router Wi-Fi without Internet and on a hotspot hosted by each phone in turn. Confirm local preference when Internet is available, Wi-Fi to mobile data, two different Wi-Fi networks, forced TURN, switching Internet access during a call, moving an active call from LAN to the Internet, missed delivery after reconnect with and without FCM, and rejection of copied or revoked activation. For sites using WireGuard, validate with two routed gateways. Record actual device, Android version, and network type for each test.
+
+## Optional routed EasyTier sites
+
+Use EasyTier v2.6.4 on Linux gateways. Download `easytier-core` from the
+official release and verify the archive checksum. Each gateway needs a Linux
+TUN device, a LAN interface and a reachable private underlay IP, for example
+from a direct Ethernet link or a private wireless backhaul.
+
+| Gateway | LAN | Underlay endpoint | EasyTier address |
+| --- | --- | --- | --- |
+| A | 192.168.10.0/24 | 192.168.50.1:11010 | 10.88.0.1/24 |
+| B | 192.168.20.0/24 | 192.168.50.2:11010 | 10.88.0.2/24 |
+
+Generate one file per gateway with `python3 deploy/easytier_site.py`. For A
+pass `--lan 192.168.10.0/24 --listen 192.168.50.1:11010 --peer
+192.168.50.2:11010 --tunnel 10.88.0.1/24 --output gateway-a.toml`.
+For B, use its own LAN, listener and tunnel address and list A's endpoint
+as the peer. Use the same randomly generated network secret on all trusted
+gateways. Repeat `--peer` to add additional reachable gateways. Every
+participating LAN needs a distinct subnet.
+
+1. Install the binary at `/usr/local/bin/easytier-core`, each gateway's
+   configuration at `/etc/wikall/easytier.toml` with mode 0600, and
+   `easytier-wikall.service` under `/etc/systemd/system/`.
+2. Enable IPv4 forwarding on both gateways and permit UDP 11010 between their
+   underlay addresses. Scope LAN/TUN forwarding to authorized WiKall devices,
+   allowing signaling TCP 8787 and WebRTC UDP between those devices. Keep the
+   firewall active and permit the intended traffic in both directions.
+3. Use each gateway as its LAN's router or configure the LAN routers to send
+   the other site's subnet through the corresponding gateway. Start
+   `easytier-wikall.service` on both sites and check route advertisements and
+   Linux routing in both directions before starting a call.
+4. Point the WiKall client at the owner's LAN address using the manual server
+   address setting and a signed activation. For automatic Internet fallback,
+   configure the HTTPS directory on both phones and leave **محلي فقط** off.
+   The call screen shows which path is active.
+5. Unplug WAN and disable mobile data to verify bidirectional audio over the
+   gateways. Then restore Internet connectivity, disconnect the private
+   backhaul and check whether WiKall can place a call through the directory.
+   Restore the backhaul and confirm that a new call prefers the local route.
+
+The gateway config advertises only the LAN subnet, with external bootstrap and
+public STUN disabled by the service. Internet fallback is provided by WiKall's
+directory. The Android app uses the gateway through ordinary IP routing.

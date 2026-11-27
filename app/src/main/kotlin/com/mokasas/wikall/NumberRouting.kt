@@ -23,8 +23,12 @@ internal class NumberRouting {
         if (message.type == SignalType.INVITE) {
             val to = message.number ?: return null
             if (!validNumber(to) || to == from || message.id in calls || message.id in completed) return null
-            if (!reachable(to)) return RoutedSignal(to, from, Signal(SignalType.UNAVAILABLE, message.id))
+            if (!reachable(to)) {
+                finish(message.id)
+                return RoutedSignal(to, from, Signal(SignalType.UNAVAILABLE, message.id))
+            }
             if (calls.values.any { it.other(from) != null || it.other(to) != null }) {
+                finish(message.id)
                 return RoutedSignal(to, from, Signal(SignalType.BUSY, message.id))
             }
             calls[message.id] = Route(from, to)
@@ -53,11 +57,13 @@ internal class NumberRouting {
 
     fun hasAcceptedCall(number: String): Boolean = calls.values.any { it.accepted && it.other(number) != null }
 
-    fun disconnected(number: String): RoutedSignal? {
+    fun disconnected(number: String, missedRinging: ((UUID, String) -> Unit)? = null): RoutedSignal? {
         val call = calls.entries.firstOrNull { it.value.other(number) != null } ?: return null
         val other = checkNotNull(call.value.other(number))
         val id = call.key
+        val reportMissed = call.value.callee == number && !call.value.accepted
         finish(id)
+        if (reportMissed) missedRinging?.invoke(id, other)
         return RoutedSignal(number, other, Signal(SignalType.END, id))
     }
 

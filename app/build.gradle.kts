@@ -15,17 +15,8 @@ android {
         minSdk = 29
         targetSdk = 35
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 5
-        versionName = "0.4.0-rc1"
-        val firebase = mapOf(
-            "google_app_id" to "WI_FCM_APP_ID",
-            "gcm_defaultSenderId" to "WI_FCM_SENDER_ID",
-            "project_id" to "WI_FCM_PROJECT",
-            "google_api_key" to "WI_FCM_API_KEY",
-        ).mapValues { (_, name) -> System.getenv(name).orEmpty() }
-        if (firebase.values.all(String::isNotBlank)) {
-            firebase.forEach { (name, value) -> resValue("string", name, value) }
-        }
+        versionCode = 6
+        versionName = "0.4.0-rc2"
     }
 
     buildFeatures {
@@ -53,11 +44,10 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.activity.compose)
     implementation(libs.serialization.json)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation(libs.room.runtime)
     implementation(libs.hilt.android)
     implementation(libs.webrtc)
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.google.firebase:firebase-messaging:24.1.2")
     kapt(libs.room.compiler)
     kapt(libs.hilt.compiler)
     testImplementation(libs.junit)
